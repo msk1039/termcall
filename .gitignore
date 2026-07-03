@@ -11,8 +11,8 @@
 *.dylib
 *.test
 *.out
-termcall
-termcall-server
+./termcall
+./termcall-server
 
 
 diagtest
