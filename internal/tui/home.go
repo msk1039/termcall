@@ -14,10 +14,73 @@ import (
 	"github.com/meow/termcall/internal/globe"
 )
 
+// cfg is the single place to tweak the home-screen globe. Edit the values and
+// re-run. It mirrors the CONFIG block in reference/globe/cmd/globe/main.go.
+var cfg = struct {
+	// RotationSpeed is how fast the globe's own axis spins (units/frame, ×0.001).
+	// 0 = static, 5 = gentle spin, 20 = fast.
+	RotationSpeed float32
+	// CamOrbitSpeed is how fast the camera orbits the globe (units/frame, ×0.001).
+	CamOrbitSpeed float32
+	// TiltX (camera beta) tilts the north pole toward/away from you.
+	// TiltY (camera alpha) yaws the globe left/right.
+	// TiltZ (texture roll) is the initial spin angle baked into the pose.
+	TiltX, TiltY, TiltZ float32
+	// Zoom is the camera distance from the globe center. Smaller = bigger globe.
+	// No lower clamp, so you can go below 1.0 for dramatic close-ups.
+	Zoom float32
+	// CanvasScale enlarges the internal render buffer relative to the terminal's
+	// smaller dimension. 1.0 = canvas fits (globe centered, sides filled with
+	// the base background). >1.0 = canvas overflows and is clipped, letting the
+	// globe grow beyond the smaller dimension (combine with lower Zoom).
+	CanvasScale float32
+	// OffsetX / OffsetY shift the globe from its centered position, in terminal
+	// cells (columns / rows). 0/0 = centered. +OffsetX moves right, +OffsetY down.
+	OffsetX int
+	OffsetY int
+	// FrameRate is the refresh rate in frames per second.
+	FrameRate int
+	// Night toggles day/night terminator shading + city lights.
+	Night bool
+	// Clouds enables the drifting cloud layer.
+	Clouds bool
+	// CloudSpeed is the cloud drift rate (units/frame, ×0.001), independent of
+	// RotationSpeed so clouds lead/lag the surface for parallax.
+	CloudSpeed float32
+	// CloudOpacity scales day-side cloud brightness (1.0 = full bright white).
+	// CloudNightOpacity scales night-side cloud brightness (0 = invisible).
+	CloudOpacity      float32
+	CloudNightOpacity float32
+	// CloudCharBright overrides the ASCII char used for the brightest cloud
+	// glyph (e.g. "w", "*", "#", "░", "·"). Empty = use the texture's own.
+	CloudCharBright string
+}{
+	RotationSpeed:     0.5,
+	CamOrbitSpeed:     1,
+	TiltX:             0.6,
+	TiltY:             -0.2,
+	TiltZ:             0,
+	Zoom:              1.4,
+	CanvasScale:       1.9,
+	OffsetX:           -10,
+	OffsetY:           20,
+	FrameRate:         30,
+	Night:             true,
+	Clouds:            true,
+	CloudSpeed:        5,
+	CloudOpacity:      1.4,
+	CloudNightOpacity: 0.40,
+	CloudCharBright:   "o",
+}
+
 type GlobeTickMsg time.Time
 
 func tickGlobe() tea.Cmd {
-	return tea.Tick(time.Second/30, func(t time.Time) tea.Msg {
+	fps := cfg.FrameRate
+	if fps < 1 {
+		fps = 30
+	}
+	return tea.Tick(time.Second/time.Duration(fps), func(t time.Time) tea.Msg {
 		return GlobeTickMsg(t)
 	})
 }
@@ -118,11 +181,11 @@ func styleForCell(r rune, night, cloud bool) (fg, bg tcell.Color) {
 			cidx = 2
 		}
 		if night {
-			fg = scaleColor(cloudWhite[cidx], 0.40)
+			fg = scaleColor(cloudWhite[cidx], cfg.CloudNightOpacity)
 			bg = baseDim[0]
 			return
 		}
-		fg = scaleColor(cloudWhite[cidx], 1.4)
+		fg = scaleColor(cloudWhite[cidx], cfg.CloudOpacity)
 		return
 	}
 
@@ -216,7 +279,7 @@ func (m *HomeModel) currentFieldIndex() int {
 
 func NewHomeModel(onReady func(JoinResult) tea.Cmd) *HomeModel {
 	var roomID, username, serverURL string
-	serverURL = "ws://localhost:8080/ws"
+	serverURL = "ws://13.127.137.230:8080/ws"
 
 	form := huh.NewForm(
 		huh.NewGroup(
@@ -257,27 +320,30 @@ func NewHomeModel(onReady func(JoinResult) tea.Cmd) *HomeModel {
 
 	g := globe.NewGlobeConfig().
 		UseTemplate(globe.Earth).
-		WithCamera(globe.NewCameraConfig(1.5, -0.2, 0.6)).
-		DisplayNight(true).
-		DisplayClouds(true).
+		WithCamera(globe.NewCameraConfig(cfg.Zoom, cfg.TiltY, cfg.TiltX)).
+		DisplayNight(cfg.Night).
+		DisplayClouds(cfg.Clouds).
 		Build()
 
-	// Override brightest cloud char
-	newChar := 'o'
-	for y, row := range g.Texture.Clouds {
-		for x, c := range row {
-			if c == 'W' {
-				g.Texture.Clouds[y][x] = newChar
+	// Override the brightest cloud glyph from config.
+	if cfg.CloudCharBright != "" {
+		newChar := []rune(cfg.CloudCharBright)[0]
+		for y, row := range g.Texture.Clouds {
+			for x, c := range row {
+				if c == 'W' {
+					g.Texture.Clouds[y][x] = newChar
+				}
 			}
 		}
+		cloudGrey[newChar] = 5
 	}
 
 	return &HomeModel{
 		form:      form,
 		onReady:   onReady,
 		g:         g,
-		spinAngle: 0,
-		orbit:     -0.2,
+		spinAngle: cfg.TiltZ,
+		orbit:     cfg.TiltY,
 	}
 }
 
@@ -310,11 +376,11 @@ func (m *HomeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case GlobeTickMsg:
-		m.spinAngle += 0.5 / 1000
-		m.orbit += 1.0 / 1000
+		m.spinAngle += cfg.RotationSpeed / 1000
+		m.orbit += cfg.CamOrbitSpeed / 1000
 		m.g.Angle = m.spinAngle
-		m.g.CloudAngle += 5.0 / 1000
-		m.g.Camera.Update(1.5, m.orbit, 0.6)
+		m.g.CloudAngle += cfg.CloudSpeed / 1000
+		m.g.Camera.Update(cfg.Zoom, m.orbit, cfg.TiltX)
 		cmds = append(cmds, tickGlobe())
 	}
 
@@ -353,14 +419,14 @@ func (m *HomeModel) View() string {
 	formView := m.form.View()
 
 	controls := lipgloss.NewStyle().
-		Foreground(theme.BorderColor).
+		Foreground(theme.ControlBarFg).
 		Render("↑/↓ switch  •  shift+tab back  •  enter submit  •  ctrl+c quit")
 
 	fg := lipgloss.NewStyle().
 		Padding(1, 2).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(theme.BorderColor).
-		Background(lipgloss.Color("#161719")). // dark background to read text
+		Background(theme.ControlBarBg). // base01 dark panel
 		Render(lipgloss.JoinVertical(lipgloss.Center, title, "\n", formView, "\n", controls))
 
 	fgLines := strings.Split(fg, "\n")
@@ -378,16 +444,21 @@ func (m *HomeModel) View() string {
 	}
 
 	// 2. Render globe canvas. The canvas is kept visually square (so the globe
-	// stays circular and is never stretched) and sized to fit the smaller
-	// terminal dimension. It is centered on screen; the empty space around it
-	// is painted with the globe's own base background color so the whole
-	// terminal is covered seamlessly (no raw terminal color showing through).
+	// stays circular and is never stretched). It is sized to the terminal's
+	// smaller dimension multiplied by cfg.CanvasScale (so >1.0 lets the globe
+	// overflow and be clipped for close-ups), centered on screen, then shifted
+	// by cfg.OffsetX/Y. The empty space around it is painted with the globe's
+	// own base background color so the whole terminal is covered seamlessly.
 	const charPixX, charPixY = 4, 8 // matches globe.Canvas default CharPix
 	physW := m.width * charPixX
 	physH := m.height * charPixY
-	side := physW
-	if physH < side {
-		side = physH
+	baseSide := physW
+	if physH < baseSide {
+		baseSide = physH
+	}
+	side := int(float32(baseSide) * cfg.CanvasScale)
+	if side < 16 {
+		side = 16
 	}
 	canvas := globe.NewCanvas(side, side, nil)
 
@@ -400,9 +471,10 @@ func (m *HomeModel) View() string {
 
 	renderGlow(canvas, rows, cols)
 
-	// Center the square canvas inside the terminal.
-	offsetX := (m.width - cols) / 2
-	offsetY := (m.height - rows) / 2
+	// Center the square canvas inside the terminal, then apply the configured
+	// offset. Cells outside the canvas are filled with the base background.
+	offsetX := (m.width-cols)/2 + cfg.OffsetX
+	offsetY := (m.height-rows)/2 + cfg.OffsetY
 
 	// 3. Composite background and foreground.
 	var sb strings.Builder
