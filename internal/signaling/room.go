@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/meow/termcall/internal/protocol"
+	"github.com/msk1039/termcall/internal/protocol"
 	"nhooyr.io/websocket"
 )
 

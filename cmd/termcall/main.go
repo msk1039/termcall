@@ -8,11 +8,11 @@ import (
 	"os"
 	"sync/atomic"
 
-	"github.com/charmbracelet/bubbletea"
-	"github.com/meow/termcall/internal/capture"
-	"github.com/meow/termcall/internal/rtc"
-	"github.com/meow/termcall/internal/signaling"
-	"github.com/meow/termcall/internal/tui"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/msk1039/termcall/internal/capture"
+	"github.com/msk1039/termcall/internal/rtc"
+	"github.com/msk1039/termcall/internal/signaling"
+	"github.com/msk1039/termcall/internal/tui"
 )
 
 func main() {

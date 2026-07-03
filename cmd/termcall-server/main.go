@@ -4,12 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"net"
+	"net/http"
 	"os"
 
-	"github.com/meow/termcall/internal/signaling"
-	"github.com/meow/termcall/internal/turn"
+	"github.com/msk1039/termcall/internal/signaling"
+	"github.com/msk1039/termcall/internal/turn"
 	turnPkg "github.com/pion/turn/v4"
 )
 
@@ -44,7 +44,7 @@ func main() {
 
 	addr := fmt.Sprintf(":%s", *port)
 	log.Printf("Starting TermCall signaling server on %s", addr)
-	
+
 	err = http.ListenAndServe(addr, mux)
 	if err != nil {
 		log.Printf("Server failed: %v", err)

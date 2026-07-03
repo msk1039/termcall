@@ -8,9 +8,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/meow/termcall/internal/ascii"
-	"github.com/meow/termcall/internal/capture"
-	"github.com/meow/termcall/internal/rtc"
+	"github.com/msk1039/termcall/internal/ascii"
+	"github.com/msk1039/termcall/internal/capture"
+	"github.com/msk1039/termcall/internal/rtc"
 )
 
 type CallModel struct {
@@ -23,9 +23,9 @@ type CallModel struct {
 	width  int
 	height int
 
-	peers       []string
-	peerFrames  map[string]string
-	peerNames   map[string]string
+	peers        []string
+	peerFrames   map[string]string
+	peerNames    map[string]string
 	peerStats    map[string]rtc.PeerStats
 	peerVolumes  map[string]float64
 	removedPeers map[string]bool
@@ -39,12 +39,12 @@ type CallModel struct {
 
 func NewCallModel(roomID string, mesh *rtc.MeshManager, camera *capture.Camera, mic *capture.Microphone) *CallModel {
 	return &CallModel{
-		roomID:      roomID,
-		mesh:        mesh,
-		camera:      camera,
-		mic:         mic,
-		camOn:       true,
-		micOn:       true,
+		roomID:       roomID,
+		mesh:         mesh,
+		camera:       camera,
+		mic:          mic,
+		camOn:        true,
+		micOn:        true,
 		peerFrames:   make(map[string]string),
 		peerNames:    make(map[string]string),
 		peerStats:    make(map[string]rtc.PeerStats),
@@ -141,13 +141,13 @@ func (m *CallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickStats()
 	case VolumeTickMsg:
 		if m.micOn {
-			// Mocking local volume pseudo-randomly for visual feedback 
+			// Mocking local volume pseudo-randomly for visual feedback
 			// since intercepting hardware audio streams cleanly is complex via CGO.
 			m.localVolume = 0.05 + rand.Float64()*0.2
 		} else {
 			m.localVolume = 0.0
 		}
-		
+
 		m.mesh.RLockPeers(func(peers map[string]*rtc.RemotePeer) {
 			for pid, p := range peers {
 				if p.Player != nil {
@@ -202,7 +202,7 @@ func (m *CallModel) View() string {
 		spacerW = 0
 	}
 	spacer := lipgloss.NewStyle().Width(spacerW).Background(theme.ControlBarBg).Render("")
-	
+
 	titleBar := lipgloss.JoinHorizontal(lipgloss.Top, titlePart, spacer, statsPart)
 
 	modeStr := "ASCII"
@@ -231,7 +231,7 @@ func (m *CallModel) View() string {
 		localFrameStr = "Camera Off"
 	}
 	localName := "You (Local)" + renderVoiceActivity(m.localVolume, theme)
-	
+
 	var localStatsStr string
 	if m.showStats {
 		mockLocalStats := rtc.PeerStats{OutgoingKBps: localOutgoingKBps, AudioOutKBps: localAudioOutKBps}
@@ -246,12 +246,12 @@ func (m *CallModel) View() string {
 		if frame == "" {
 			frame = "Waiting for video..."
 		}
-		
+
 		var remoteStatsStr string
 		if m.showStats {
 			remoteStatsStr = renderIncomingStats(m.peerStats[p], theme)
 		}
-		
+
 		cells = append(cells, renderCellTmux(name, frame, remoteStatsStr, boxW, boxH, innerW, innerH, theme))
 	}
 
@@ -274,12 +274,12 @@ func (m *CallModel) View() string {
 func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInnerH int, theme Theme) string {
 	nameBg := theme.ActiveBtnBg
 	nameFg := theme.ActiveBtnFg
-	
+
 	nameLabel := lipgloss.NewStyle().Background(nameBg).Foreground(nameFg).Bold(true).Padding(0, 1).Render(name)
 	nameArrow := lipgloss.NewStyle().Background(theme.BorderColor).Foreground(nameBg).Render("")
-	
+
 	topBarLeft := lipgloss.JoinHorizontal(lipgloss.Top, nameLabel, nameArrow)
-	
+
 	topBarRight := ""
 	if statsStr != "" {
 		statsArrow := lipgloss.NewStyle().Background(theme.BorderColor).Foreground(theme.StatsBg).Render("")
@@ -291,7 +291,7 @@ func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInne
 		fillerW = 0
 	}
 	filler := lipgloss.NewStyle().Background(theme.BorderColor).Width(fillerW).Render("")
-	
+
 	topBar := lipgloss.JoinHorizontal(lipgloss.Top, topBarLeft, filler, topBarRight)
 
 	lines := strings.Split(frame, "\n")
@@ -299,7 +299,7 @@ func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInne
 		lines = lines[:maxInnerH]
 	}
 	safeFrame := strings.Join(lines, "\n")
-	
+
 	content := lipgloss.JoinVertical(lipgloss.Left, topBar, safeFrame)
 	return lipgloss.Place(boxW, boxH, lipgloss.Center, lipgloss.Center, content)
 }

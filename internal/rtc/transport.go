@@ -1,6 +1,6 @@
 package rtc
 
-import "github.com/meow/termcall/internal/protocol"
+import "github.com/msk1039/termcall/internal/protocol"
 
 // SignalTransport defines how the client talks to the signaling server.
 type SignalTransport interface {

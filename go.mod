@@ -1,4 +1,4 @@
-module github.com/meow/termcall
+module github.com/msk1039/termcall
 
 go 1.25.6
 

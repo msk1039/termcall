@@ -11,7 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/meow/termcall/internal/globe"
+	"github.com/msk1039/termcall/internal/globe"
 )
 
 // cfg is the single place to tweak the home-screen globe. Edit the values and

@@ -6,8 +6,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/meow/termcall/internal/playback"
-	"github.com/meow/termcall/internal/protocol"
+	"github.com/msk1039/termcall/internal/playback"
+	"github.com/msk1039/termcall/internal/protocol"
 	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 )

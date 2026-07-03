@@ -6,7 +6,7 @@ import (
 	"log"
 	"sync"
 
-	"github.com/meow/termcall/internal/protocol"
+	"github.com/msk1039/termcall/internal/protocol"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
@@ -60,12 +60,12 @@ func (c *Client) Receive() <-chan protocol.SignalingMessage {
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
+
 	// Send leave message
 	wsjson.Write(c.ctx, c.conn, protocol.SignalingMessage{
 		Type: protocol.MsgLeaveRoom,
 	})
-	
+
 	return c.conn.Close(websocket.StatusNormalClosure, "")
 }
 

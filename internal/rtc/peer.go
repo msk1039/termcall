@@ -3,26 +3,26 @@ package rtc
 import (
 	"sync"
 
+	"github.com/msk1039/termcall/internal/playback"
 	"github.com/pion/webrtc/v4"
-	"github.com/meow/termcall/internal/playback"
 )
 
 type RemotePeer struct {
-	PeerID     string
-	Username   string
-	PC         *webrtc.PeerConnection
-	DataChan   *webrtc.DataChannel // For ASCII frames
-	ControlChan *webrtc.DataChannel // For reliable control messages
-	AudioTrack  *webrtc.TrackRemote // Incoming audio
-	AudioSender *webrtc.RTPSender   // Outgoing audio sender (for muting)
-	Player      *playback.Player    // Playback engine
-	LastFrame   string              // Latest ASCII frame for rendering
-	Stats       PeerStats
+	PeerID        string
+	Username      string
+	PC            *webrtc.PeerConnection
+	DataChan      *webrtc.DataChannel // For ASCII frames
+	ControlChan   *webrtc.DataChannel // For reliable control messages
+	AudioTrack    *webrtc.TrackRemote // Incoming audio
+	AudioSender   *webrtc.RTPSender   // Outgoing audio sender (for muting)
+	Player        *playback.Player    // Playback engine
+	LastFrame     string              // Latest ASCII frame for rendering
+	Stats         PeerStats
 	prevVideoSent uint64
 	prevVideoRecv uint64
 	prevAudioSent uint64
 	prevAudioRecv uint64
-	mu         sync.RWMutex
+	mu            sync.RWMutex
 }
 
 type PeerStats struct {
@@ -97,8 +97,8 @@ func (rp *RemotePeer) UpdateStats(intervalSeconds float64) {
 			}
 		}
 	}
-	
-	// DataChannels don't show up in RTPStats. 
+
+	// DataChannels don't show up in RTPStats.
 	// To get data channel stats we need to check DataChannelStats.
 	for _, stat := range stats {
 		if s, ok := stat.(webrtc.DataChannelStats); ok && s.Label == "video-ascii" {
