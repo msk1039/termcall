@@ -1,0 +1,28 @@
+/archive
+/docs
+/plans
+/.agents
+
+# Binaries
+*.exe
+*.exe~*
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+termcall
+termcall-server
+
+
+diagtest
+
+# Logs
+*.log
+
+# Agent files
+skills-lock.json
+
+# Markdown files
+*.md
+!README.md
