@@ -9,8 +9,9 @@ import (
 )
 
 type JoinResult struct {
-	RoomID   string
-	Username string
+	RoomID    string
+	Username  string
+	ServerURL string
 }
 
 type JoinModel struct {

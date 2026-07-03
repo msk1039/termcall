@@ -286,7 +286,7 @@ func (m *MeshManager) createPeerConnection(peerID string) (*webrtc.PeerConnectio
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		log.Printf("Peer %s state changed: %s", peerID, s.String())
-		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
+		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed || s == webrtc.PeerConnectionStateDisconnected {
 			m.handlePeerLeft(peerID)
 		}
 	})

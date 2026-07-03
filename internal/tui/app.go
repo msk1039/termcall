@@ -9,7 +9,7 @@ import (
 type screen int
 
 const (
-	screenJoin screen = iota
+	screenHome screen = iota
 	screenCall
 )
 
@@ -37,22 +37,22 @@ type VolumeTickMsg struct{}
 
 type AppModel struct {
 	currentScreen screen
-	joinModel     *JoinModel
+	homeModel     *HomeModel
 	callModel     *CallModel
 
 	width  int
 	height int
 }
 
-func NewAppModel(skipForm bool, defaultRoom, defaultUser string, startCall func(JoinResult) *CallModel) *AppModel {
+func NewAppModel(skipForm bool, defaultRoom, defaultUser, defaultServer string, startCall func(JoinResult) *CallModel) *AppModel {
 	m := &AppModel{}
 
 	if skipForm {
 		m.currentScreen = screenCall
-		m.callModel = startCall(JoinResult{RoomID: defaultRoom, Username: defaultUser})
+		m.callModel = startCall(JoinResult{RoomID: defaultRoom, Username: defaultUser, ServerURL: defaultServer})
 	} else {
-		m.currentScreen = screenJoin
-		m.joinModel = NewJoinModel(func(res JoinResult) tea.Cmd {
+		m.currentScreen = screenHome
+		m.homeModel = NewHomeModel(func(res JoinResult) tea.Cmd {
 			m.currentScreen = screenCall
 			m.callModel = startCall(res)
 			
@@ -67,8 +67,8 @@ func NewAppModel(skipForm bool, defaultRoom, defaultUser string, startCall func(
 }
 
 func (m *AppModel) Init() tea.Cmd {
-	if m.currentScreen == screenJoin {
-		return m.joinModel.Init()
+	if m.currentScreen == screenHome {
+		return m.homeModel.Init()
 	}
 	return m.callModel.Init()
 }
@@ -83,8 +83,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		if m.joinModel != nil {
-			m.joinModel.Update(msg)
+		if m.homeModel != nil {
+			m.homeModel.Update(msg)
 		}
 		if m.callModel != nil {
 			m.callModel.Update(msg)
@@ -99,9 +99,9 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.currentScreen == screenJoin {
-		jm, cmd := m.joinModel.Update(msg)
-		m.joinModel = jm.(*JoinModel)
+	if m.currentScreen == screenHome {
+		hm, cmd := m.homeModel.Update(msg)
+		m.homeModel = hm.(*HomeModel)
 		return m, cmd
 	}
 
@@ -111,8 +111,8 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *AppModel) View() string {
-	if m.currentScreen == screenJoin {
-		return m.joinModel.View()
+	if m.currentScreen == screenHome {
+		return m.homeModel.View()
 	}
 	if m.callModel != nil {
 		return m.callModel.View()

@@ -26,9 +26,10 @@ type CallModel struct {
 	peers       []string
 	peerFrames  map[string]string
 	peerNames   map[string]string
-	peerStats   map[string]rtc.PeerStats
-	peerVolumes map[string]float64
-	localVolume float64
+	peerStats    map[string]rtc.PeerStats
+	peerVolumes  map[string]float64
+	removedPeers map[string]bool
+	localVolume  float64
 
 	localFrame []byte
 	renderer   *ascii.ColorRenderer
@@ -44,11 +45,12 @@ func NewCallModel(roomID string, mesh *rtc.MeshManager, camera *capture.Camera, 
 		mic:         mic,
 		camOn:       true,
 		micOn:       true,
-		peerFrames:  make(map[string]string),
-		peerNames:   make(map[string]string),
-		peerStats:   make(map[string]rtc.PeerStats),
-		peerVolumes: make(map[string]float64),
-		renderer:    ascii.NewColorRenderer(ascii.ModeColor256),
+		peerFrames:   make(map[string]string),
+		peerNames:    make(map[string]string),
+		peerStats:    make(map[string]rtc.PeerStats),
+		peerVolumes:  make(map[string]float64),
+		removedPeers: make(map[string]bool),
+		renderer:     ascii.NewColorRenderer(ascii.ModeColor256),
 	}
 }
 
@@ -103,6 +105,9 @@ func (m *CallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.RemovePeer(msg.PeerID)
 		return m, nil
 	case PeerFrameMsg:
+		if m.removedPeers[msg.PeerID] {
+			return m, nil
+		}
 		if _, ok := m.peerNames[msg.PeerID]; !ok {
 			m.peerNames[msg.PeerID] = "Peer " + msg.PeerID
 			m.peers = append(m.peers, msg.PeerID)
@@ -317,4 +322,5 @@ func (m *CallModel) RemovePeer(peerID string) {
 	delete(m.peerFrames, peerID)
 	delete(m.peerStats, peerID)
 	delete(m.peerVolumes, peerID)
+	m.removedPeers[peerID] = true
 }
