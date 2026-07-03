@@ -16,12 +16,24 @@ import (
 )
 
 func main() {
-	serverURL := flag.String("server", "", "Signaling server URL (optional, skips form if room and username also provided)")
-	roomID := flag.String("room", "", "Room ID (optional, skips form if server and username also provided)")
-	username := flag.String("username", "", "Username (optional, skips form if server and room also provided)")
+	username := flag.String("username", "", "Username for the call (with -room, skips the join form)")
+	roomID := flag.String("room", "", "Room ID to join (with -username, skips the join form)")
+	serverURL := flag.String("server", "", "Signaling server URL (defaults to "+tui.DefaultServerURL+")")
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, "Usage:")
+		fmt.Fprintln(out, "  termcall                                         Start the TUI join form.")
+		fmt.Fprintln(out, "  termcall -username <name> -room <room> [-server <url>]")
+		fmt.Fprintln(out, "                                                   Skip the form and join directly.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "With flags, both -username and -room are required; -server is optional and")
+		fmt.Fprintln(out, "defaults to "+tui.DefaultServerURL+".")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "Flags:")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
-	// ...
 	// Setup context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -32,7 +44,23 @@ func main() {
 	}
 	defer f.Close()
 
-	skipForm := *serverURL != "" && *roomID != "" && *username != ""
+	// Two ways in: no flags -> TUI join form; or -username + -room (with
+	// -server optional). Anything in between is a partial invocation.
+	skipForm := false
+	effectiveServer := *serverURL
+	switch {
+	case *username == "" && *roomID == "" && *serverURL == "":
+		// No flags: show the join form.
+	case *username != "" && *roomID != "":
+		skipForm = true
+		if effectiveServer == "" {
+			effectiveServer = tui.DefaultServerURL
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "please pass all the arguments: -username and -room are required (-server is optional).")
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	var p atomic.Pointer[tea.Program]
 	send := func(msg tea.Msg) {
@@ -117,7 +145,7 @@ func main() {
 		return callModel
 	}
 
-	app := tui.NewAppModel(skipForm, *roomID, *username, *serverURL, startCall)
+	app := tui.NewAppModel(skipForm, *roomID, *username, effectiveServer, startCall)
 	prog := tea.NewProgram(app, tea.WithAltScreen())
 	p.Store(prog)
 

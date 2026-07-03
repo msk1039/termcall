@@ -50,7 +50,7 @@ func NewCallModel(roomID string, mesh *rtc.MeshManager, camera *capture.Camera, 
 		peerStats:    make(map[string]rtc.PeerStats),
 		peerVolumes:  make(map[string]float64),
 		removedPeers: make(map[string]bool),
-		renderer:     ascii.NewColorRenderer(ascii.ModeColor256),
+		renderer:     ascii.NewColorRenderer(ascii.ModeHalfBlock),
 	}
 }
 

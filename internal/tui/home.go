@@ -14,6 +14,11 @@ import (
 	"github.com/msk1039/termcall/internal/globe"
 )
 
+// DefaultServerURL is the signaling server used when none is provided — both
+// as the join form's default value and as the fallback for the
+// -username/-room CLI shortcut.
+const DefaultServerURL = "ws://13.127.137.230:8080/ws"
+
 // cfg is the single place to tweak the home-screen globe. Edit the values and
 // re-run. It mirrors the CONFIG block in reference/globe/cmd/globe/main.go.
 var cfg = struct {
@@ -279,7 +284,7 @@ func (m *HomeModel) currentFieldIndex() int {
 
 func NewHomeModel(onReady func(JoinResult) tea.Cmd) *HomeModel {
 	var roomID, username, serverURL string
-	serverURL = "ws://13.127.137.230:8080/ws"
+	serverURL = DefaultServerURL
 
 	form := huh.NewForm(
 		huh.NewGroup(
