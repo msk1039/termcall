@@ -3,8 +3,12 @@ package signaling
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"syscall"
 
 	"github.com/google/uuid"
 	"github.com/msk1039/termcall/internal/protocol"
@@ -60,7 +64,12 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		var msg protocol.SignalingMessage
 		err := wsjson.Read(ctx, c, &msg)
 		if err != nil {
-			if websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+			// A read error almost always means the peer went away — a clean
+			// WebSocket close, an abrupt TCP drop (EOF / reset), or a canceled
+			// context. Those are expected, so stay quiet and let the cleanup
+			// below handle it. Only surface genuine protocol errors (e.g.
+			// malformed JSON).
+			if !isDisconnect(err) {
 				log.Printf("Error reading message from peer %s: %v", peerID, err)
 			}
 			break
@@ -180,6 +189,24 @@ func (s *Server) sendError(peer *Peer, errorMsg string) {
 		Type:    protocol.MsgError,
 		Payload: toJSON(errorMsg),
 	}
+}
+
+// isDisconnect reports whether err represents the peer going away — a clean
+// WebSocket close, an abrupt TCP drop (EOF / reset), a canceled context, or a
+// closed connection — as opposed to a genuine read/protocol error (e.g.
+// malformed JSON) that is worth surfacing in the logs.
+func isDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if websocket.CloseStatus(err) != -1 { // any WebSocket close frame
+		return true
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 func toJSON(v interface{}) json.RawMessage {
