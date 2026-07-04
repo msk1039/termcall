@@ -13,12 +13,15 @@
 *.out
 ./termcall
 ./termcall-server
-
+/build
 
 diagtest
 
 # Logs
 *.log
+
+# Local config (keep .env.example tracked)
+.env
 
 # Agent files
 skills-lock.json

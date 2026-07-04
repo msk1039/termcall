@@ -105,3 +105,61 @@ Once you're in a call:
 - **[S]** Toggle stats overlay (bandwidth, loss, ping)
 - **[N]** Cycle render mode (ASCII → Color256 → HalfBlock; defaults to HalfBlock)
 - **[Q]** Quit
+
+## Self-hosting the server
+
+TermCall needs a signaling + TURN server to pair peers and relay media when direct connections fail. The `termcall-server` binary runs both in one process, and you can host it on any Linux VPS with a public IP.
+
+### Build the server
+
+On your VPS (or locally, then copy the binary over):
+
+```bash
+git clone https://github.com/msk1039/termcall.git
+cd termcall
+go mod tidy
+go build -o termcall-server ./cmd/termcall-server
+```
+
+The server has no CGO dependency, so it builds with plain `go build` — no C toolchain required.
+
+### Configure `.env`
+
+Copy the template and set your public IP:
+
+```bash
+cp .env.example .env
+curl -s ifconfig.me   # your server's public IP
+```
+
+Edit `.env` and set `TERMCALL_PUBLIC_IP` to that address. Only that field is required — ports, the relay range, max room size, and the TURN secret all have defaults you can leave as-is or tweak.
+
+### Open the firewall ports
+
+By default the server uses a WebSocket port (`8080/tcp`), a TURN port (`3478/tcp+udp`), and a UDP relay range (`49152-65535/udp`). Open them with the included script, which reads your `.env`:
+
+```bash
+sudo ./scripts/setup_firewall.sh
+```
+
+> If your VPS has a cloud firewall too (AWS Security Groups, Hetzner, DigitalOcean, etc.), open the same ports there — the script only configures the OS-level firewall.
+
+> On restrictive networks (some mobile carriers, corporate Wi-Fi), TURN on port 443 reaches clients that block 3478. Set `TERMCALL_TURN_PORT=443` in `.env` if you run into that.
+
+### Run the server
+
+```bash
+./termcall-server
+```
+
+The startup log lists the WebSocket port, TURN port, relay range, public IP, and max room size. Run it under `tmux` or `systemd` so it stays up.
+
+### Point clients at it
+
+Enter the server URL in the join form, or pass it with `-server`:
+
+```bash
+./termcall -username alice -room my-room -server ws://YOUR.VPS.IP:8080/ws
+```
+
+Anyone who joins the same room on your server gets connected.

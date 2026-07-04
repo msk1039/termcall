@@ -17,13 +17,15 @@ type Server struct {
 	turnURLs    []string
 	turnUser    string
 	turnSecret  string
+	maxRoomSize int
 }
 
-func NewServer(turnURLs []string, turnSecret string) *Server {
+func NewServer(turnURLs []string, turnSecret string, maxRoomSize int) *Server {
 	return &Server{
 		roomManager: NewRoomManager(),
 		turnURLs:    turnURLs,
 		turnSecret:  turnSecret,
+		maxRoomSize: maxRoomSize,
 	}
 }
 
@@ -76,7 +78,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 				peer.Username = "Guest-" + peer.ID
 			}
 
-			room := s.roomManager.GetOrCreateRoom(msg.RoomID, 5)
+			room := s.roomManager.GetOrCreateRoom(msg.RoomID, s.maxRoomSize)
 			err := room.AddPeer(peer)
 			if err != nil {
 				s.sendError(peer, err.Error())

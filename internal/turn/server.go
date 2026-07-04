@@ -15,10 +15,12 @@ type Server struct {
 
 // Config for TURN server
 type Config struct {
-	PublicIP string
-	Port     int
-	Realm    string
-	Auth     turn.AuthHandler
+	PublicIP     string
+	Port         int
+	Realm        string
+	Auth         turn.AuthHandler
+	MinRelayPort uint16
+	MaxRelayPort uint16
 }
 
 // NewServer creates a new STUN/TURN server
@@ -33,7 +35,7 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create TURN TCP listener: %w", err)
 	}
 
-	log.Printf("Starting STUN/TURN server on UDP %d (Public IP: %s)", cfg.Port, cfg.PublicIP)
+	log.Printf("Starting STUN/TURN server on UDP+TCP %d, relay %d-%d (Public IP: %s)", cfg.Port, cfg.MinRelayPort, cfg.MaxRelayPort, cfg.PublicIP)
 
 	s, err := turn.NewServer(turn.ServerConfig{
 		Realm:         cfg.Realm,
@@ -45,8 +47,8 @@ func NewServer(cfg Config) (*Server, error) {
 				RelayAddressGenerator: &turn.RelayAddressGeneratorPortRange{
 					RelayAddress: net.ParseIP(cfg.PublicIP),
 					Address:      "0.0.0.0",
-					MinPort:      50000,
-					MaxPort:      50050,
+					MinPort:      cfg.MinRelayPort,
+					MaxPort:      cfg.MaxRelayPort,
 				},
 			},
 		},
@@ -56,8 +58,8 @@ func NewServer(cfg Config) (*Server, error) {
 				RelayAddressGenerator: &turn.RelayAddressGeneratorPortRange{
 					RelayAddress: net.ParseIP(cfg.PublicIP),
 					Address:      "0.0.0.0",
-					MinPort:      50000,
-					MaxPort:      50050,
+					MinPort:      cfg.MinRelayPort,
+					MaxPort:      cfg.MaxRelayPort,
 				},
 			},
 		},
