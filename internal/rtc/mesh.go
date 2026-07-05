@@ -3,8 +3,12 @@ package rtc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/msk1039/termcall/internal/playback"
 	"github.com/msk1039/termcall/internal/protocol"
@@ -13,6 +17,7 @@ import (
 )
 
 type MeshManager struct {
+	frameSeq    atomic.Uint64
 	LocalPeerID string
 	Peers       map[string]*RemotePeer
 	mu          sync.RWMutex
@@ -109,17 +114,49 @@ func (m *MeshManager) SetMuteAudio(muted bool) {
 	}
 }
 
+// maxBufferedAmount is the maximum number of bytes allowed in the DataChannel's
+// SCTP send buffer before we start dropping frames. This prevents buffer bloat
+// when the network is congested — without it, frames pile up during congestion
+// and replay in a burst when the network recovers.
+const maxBufferedAmount = 64 * 1024 // 64 KB
+
 func (m *MeshManager) BroadcastFrame(frame []byte) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	// Tag the frame with a monotonically increasing sequence number so the
+	// receiver can drop stale frames that arrive out of order.
+	seq := m.frameSeq.Add(1)
+	tagged := fmt.Sprintf("%d\n%s", seq, string(frame))
+
 	for _, p := range m.Peers {
-		if p.DataChan != nil && p.DataChan.ReadyState() == webrtc.DataChannelStateOpen {
-			err := p.DataChan.SendText(string(frame))
-			if err != nil {
-				// log.Printf("Failed to send frame to %s: %v", p.PeerID, err)
-			}
+		if p.DataChan == nil || p.DataChan.ReadyState() != webrtc.DataChannelStateOpen {
+			continue
+		}
+		// Drop the frame if the send buffer is backed up for this peer. Queued
+		// frames arrive late and cause a "replay" effect on the receiver, so
+		// skipping is better than piling on more data.
+		if p.DataChan.BufferedAmount() > maxBufferedAmount {
+			continue
+		}
+		if err := p.DataChan.SendText(tagged); err != nil {
+			// Send errors are non-fatal for individual frames.
 		}
 	}
+}
+
+// parseTaggedFrame splits a "<seq>\n<frame>" message into its sequence number
+// and frame data. Returns ok=false if the message is malformed.
+func parseTaggedFrame(raw string) (seq uint64, data string, ok bool) {
+	idx := strings.IndexByte(raw, '\n')
+	if idx < 0 {
+		return 0, "", false
+	}
+	s, err := strconv.ParseUint(raw[:idx], 10, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return s, raw[idx+1:], true
 }
 
 func (m *MeshManager) readSignalingLoop() {
@@ -340,11 +377,19 @@ func (m *MeshManager) handlePeerJoined(msg protocol.SignalingMessage) {
 			if dc.Label() == "video-ascii" {
 				peer.DataChan = dc
 				dc.OnMessage(func(dMsg webrtc.DataChannelMessage) {
-					if dMsg.IsString {
-						peer.UpdateFrame(string(dMsg.Data))
-						if m.OnFrame != nil {
-							m.OnFrame(peerID, string(dMsg.Data))
-						}
+					if !dMsg.IsString {
+						return
+					}
+					seq, frame, ok := parseTaggedFrame(string(dMsg.Data))
+					if !ok {
+						return
+					}
+					if !peer.CompareAndUpdateSeq(seq) {
+						return
+					}
+					peer.UpdateFrame(frame)
+					if m.OnFrame != nil {
+						m.OnFrame(peerID, frame)
 					}
 				})
 			}
@@ -368,11 +413,19 @@ func (m *MeshManager) handlePeerJoined(msg protocol.SignalingMessage) {
 	peer.DataChan = dc
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if msg.IsString {
-			peer.UpdateFrame(string(msg.Data))
-			if m.OnFrame != nil {
-				m.OnFrame(peerID, string(msg.Data))
-			}
+		if !msg.IsString {
+			return
+		}
+		seq, frame, ok := parseTaggedFrame(string(msg.Data))
+		if !ok {
+			return
+		}
+		if !peer.CompareAndUpdateSeq(seq) {
+			return
+		}
+		peer.UpdateFrame(frame)
+		if m.OnFrame != nil {
+			m.OnFrame(peerID, frame)
 		}
 	})
 

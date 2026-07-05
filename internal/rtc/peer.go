@@ -2,12 +2,14 @@ package rtc
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/msk1039/termcall/internal/playback"
 	"github.com/pion/webrtc/v4"
 )
 
 type RemotePeer struct {
+	lastSeq       atomic.Uint64
 	PeerID        string
 	Username      string
 	PC            *webrtc.PeerConnection
@@ -48,6 +50,22 @@ func (rp *RemotePeer) GetFrame() string {
 	rp.mu.RLock()
 	defer rp.mu.RUnlock()
 	return rp.LastFrame
+}
+
+// CompareAndUpdateSeq returns true if seq is newer than the last seen sequence
+// number for this peer and updates the stored value. Returns false if the frame
+// is stale (older than one already processed), so the caller can drop it. It is
+// lock-free since the DataChannel OnMessage path is hot.
+func (rp *RemotePeer) CompareAndUpdateSeq(seq uint64) bool {
+	for {
+		old := rp.lastSeq.Load()
+		if seq <= old {
+			return false
+		}
+		if rp.lastSeq.CompareAndSwap(old, seq) {
+			return true
+		}
+	}
 }
 
 func (rp *RemotePeer) Close() {
