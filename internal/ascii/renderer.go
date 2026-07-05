@@ -2,89 +2,130 @@ package ascii
 
 import (
 	"image"
-	"strings"
+	"math"
 )
 
-// Renderer converts a raw image frame to an ASCII string representation.
+// RenderMode defines how video frames are converted to strings.
+type RenderMode int
+
+const (
+	ModeASCII     RenderMode = iota // monochrome ASCII characters
+	ModeColor256                    // ASCII chars with 256-color foreground
+	ModeHalfBlock                   // half-block chars with 256-color fg+bg
+)
+
+// Renderer converts a raw image frame to a terminal string.
 type Renderer interface {
-	// Convert transforms an image into an ASCII string of the given
-	// terminal dimensions (width in columns, height in rows).
 	Convert(img image.Image, targetWidth, targetHeight int) string
 }
 
-// Config holds tunable parameters for a renderer.
-type Config struct {
-	Gradient  string // character set from darkest to lightest
-	Invert    bool   // flip luminance mapping
-	ColorMode string // "none", "ansi256", "truecolor" (future)
+// DefaultGradient is the character ramp from dark to light.
+const DefaultGradient = " .:-=+*#%@"
+
+// rgbToANSI256 maps a 16-bit RGB triplet to a 256-color ANSI index.
+func rgbToANSI256(r, g, b uint32) int {
+	r8 := int(r >> 8)
+	g8 := int(g >> 8)
+	b8 := int(b >> 8)
+
+	if r8 == g8 && g8 == b8 {
+		if r8 < 8 {
+			return 16
+		}
+		if r8 > 248 {
+			return 231
+		}
+		return int(math.Round(float64(r8-8)/247.0*24.0)) + 232
+	}
+
+	return 16 + 36*int(math.Round(float64(r8)/255.0*5.0)) + 6*int(math.Round(float64(g8)/255.0*5.0)) + int(math.Round(float64(b8)/255.0*5.0))
 }
 
-// DefaultRenderer is the standard ASCII renderer using luminance.
-type DefaultRenderer struct {
-	config Config
+// ColorRenderer converts an image into ANSI-coloured terminal output. It
+// separates colour computation (a Cell grid) from serialisation, runs a noise-
+// suppression stabiliser over the grid, and delta-encodes the result for
+// bandwidth-efficient transport.
+type ColorRenderer struct {
+	mode       RenderMode
+	gradient   string
+	stabiliser *Stabiliser
+	delta      *DeltaEncoder
 }
 
-// NewDefaultRenderer creates a new DefaultRenderer.
-func NewDefaultRenderer(config Config) *DefaultRenderer {
-	if config.Gradient == "" {
-		config.Gradient = " .:-=+*#%@"
+// NewColorRenderer creates a renderer for the given mode with noise suppression
+// (threshold 1 ANSI step) and delta compression (keyframe every ~2s at 15fps).
+func NewColorRenderer(mode RenderMode) *ColorRenderer {
+	return &ColorRenderer{
+		mode:       mode,
+		gradient:   DefaultGradient,
+		stabiliser: NewStabiliser(1),
+		delta:      NewDeltaEncoder(mode, 30),
 	}
-	return &DefaultRenderer{config: config}
 }
 
-// Convert implements the Renderer interface.
-func (r *DefaultRenderer) Convert(img image.Image, targetWidth, targetHeight int) string {
-	bounds := img.Bounds()
-	width := bounds.Max.X - bounds.Min.X
-	height := bounds.Max.Y - bounds.Min.Y
-
-	if targetWidth <= 0 {
-		targetWidth = 80
+func (r *ColorRenderer) SetMode(mode RenderMode) {
+	r.mode = mode
+	if r.delta != nil {
+		r.delta.mode = mode
+		r.delta.Reset()
 	}
-	if targetHeight <= 0 {
-		targetHeight = 24
+	if r.stabiliser != nil {
+		r.stabiliser.Reset()
 	}
+}
 
-	xScale := float64(width) / float64(targetWidth)
-	yScale := float64(height) / float64(targetHeight)
+func (r *ColorRenderer) GetMode() RenderMode {
+	return r.mode
+}
 
-	var sb strings.Builder
-	sb.Grow(targetHeight * (targetWidth + 1))
-
-	gradient := r.config.Gradient
-	if r.config.Invert {
-		// Reverse gradient
-		runes := []rune(gradient)
-		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
-			runes[i], runes[j] = runes[j], runes[i]
-		}
-		gradient = string(runes)
+// renderCells produces the cell grid for the current mode.
+func (r *ColorRenderer) renderCells(img image.Image, w, h int) [][]Cell {
+	switch r.mode {
+	case ModeASCII:
+		return r.renderASCIICells(img, w, h)
+	case ModeColor256:
+		return r.renderColor256Cells(img, w, h)
+	case ModeHalfBlock:
+		return r.renderHalfBlockCells(img, w, h)
 	}
+	return nil
+}
 
-	for y := 0; y < targetHeight; y++ {
-		for x := 0; x < targetWidth; x++ {
-			srcX := bounds.Min.X + int(float64(x)*xScale)
-			srcY := bounds.Min.Y + int(float64(y)*yScale)
-
-			rColor, g, b, _ := img.At(srcX, srcY).RGBA()
-
-			// Luminance formula
-			luminance := (0.299*float64(rColor) + 0.587*float64(g) + 0.114*float64(b)) / 256.0
-
-			idx := int((luminance / 255.0) * float64(len(gradient)-1))
-			if idx < 0 {
-				idx = 0
-			}
-			if idx >= len(gradient) {
-				idx = len(gradient) - 1
-			}
-
-			sb.WriteByte(gradient[idx])
-		}
-		if y < targetHeight-1 {
-			sb.WriteByte('\n')
-		}
+// serialise converts a cell grid to an ANSI string for the current mode.
+func (r *ColorRenderer) serialise(cells [][]Cell) string {
+	switch r.mode {
+	case ModeASCII:
+		return serialiseASCII(cells)
+	case ModeColor256:
+		return serialiseColor256(cells)
+	case ModeHalfBlock:
+		return serialiseHalfBlock(cells)
 	}
+	return ""
+}
 
-	return sb.String()
+// Convert renders an image to a full ANSI display string (noise-suppressed).
+// This is the display path; it does not delta-encode.
+func (r *ColorRenderer) Convert(img image.Image, targetWidth, targetHeight int) string {
+	cells := r.renderCells(img, targetWidth, targetHeight)
+	if r.stabiliser != nil {
+		cells = r.stabiliser.Stabilise(cells)
+	}
+	return r.serialise(cells)
+}
+
+// ConvertForSend renders an image and returns both the full ANSI display
+// string (for local display) and a delta-encoded string (for the network).
+func (r *ColorRenderer) ConvertForSend(img image.Image, w, h int) (displayStr, sendStr string) {
+	cells := r.renderCells(img, w, h)
+	if r.stabiliser != nil {
+		cells = r.stabiliser.Stabilise(cells)
+	}
+	displayStr = r.serialise(cells)
+	if r.delta != nil {
+		sendStr = r.delta.Encode(cells)
+	} else {
+		sendStr = displayStr
+	}
+	return
 }

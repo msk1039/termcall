@@ -13,6 +13,14 @@ import (
 	"github.com/msk1039/termcall/internal/rtc"
 )
 
+const (
+	// maxSendWidth and maxSendHeight cap the rendered frame dimensions sent
+	// over the network. Frames larger than this waste bandwidth because
+	// receivers display them in smaller grid cells.
+	maxSendWidth  = 100
+	maxSendHeight = 30
+)
+
 type CallModel struct {
 	mesh   *rtc.MeshManager
 	camera *capture.Camera
@@ -29,6 +37,7 @@ type CallModel struct {
 	peerStats    map[string]rtc.PeerStats
 	peerVolumes  map[string]float64
 	removedPeers map[string]bool
+	peerDecoders map[string]*ascii.DeltaDecoder
 	localVolume  float64
 
 	localFrame []byte
@@ -50,6 +59,7 @@ func NewCallModel(roomID string, mesh *rtc.MeshManager, camera *capture.Camera, 
 		peerStats:    make(map[string]rtc.PeerStats),
 		peerVolumes:  make(map[string]float64),
 		removedPeers: make(map[string]bool),
+		peerDecoders: make(map[string]*ascii.DeltaDecoder),
 		renderer:     ascii.NewColorRenderer(ascii.ModeHalfBlock),
 	}
 }
@@ -112,7 +122,12 @@ func (m *CallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.peerNames[msg.PeerID] = "Peer " + msg.PeerID
 			m.peers = append(m.peers, msg.PeerID)
 		}
-		m.peerFrames[msg.PeerID] = msg.Frame
+		dec, ok := m.peerDecoders[msg.PeerID]
+		if !ok {
+			dec = ascii.NewDeltaDecoder()
+			m.peerDecoders[msg.PeerID] = dec
+		}
+		m.peerFrames[msg.PeerID] = dec.Decode(msg.Frame)
 		return m, nil
 	case LocalFrameMsg:
 		totalPeers := len(m.peers) + 1
@@ -124,11 +139,20 @@ func (m *CallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		_, _, _, innerW, innerH := computeGrid(totalPeers, m.width, availH)
 
-		asciiStr := m.renderer.Convert(msg.RawImage, innerW, innerH)
-		m.localFrame = []byte(asciiStr)
+		// Cap render size for bandwidth and CPU efficiency.
+		if innerW > maxSendWidth {
+			innerW = maxSendWidth
+		}
+		if innerH > maxSendHeight {
+			innerH = maxSendHeight
+		}
 
 		if m.camOn {
-			m.mesh.BroadcastFrame(m.localFrame)
+			displayStr, sendStr := m.renderer.ConvertForSend(msg.RawImage, innerW, innerH)
+			m.localFrame = []byte(displayStr)
+			m.mesh.BroadcastFrame([]byte(sendStr))
+		} else {
+			m.localFrame = []byte(m.renderer.Convert(msg.RawImage, innerW, innerH))
 		}
 		return m, nil
 	case StatsTickMsg:
@@ -275,7 +299,7 @@ func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInne
 	nameBg := theme.ActiveBtnBg
 	nameFg := theme.ActiveBtnFg
 
-	nameLabel := lipgloss.NewStyle().Background(nameBg).Foreground(nameFg).Bold(true).Padding(0, 1).Render(name)
+	nameLabel := lipgloss.NewStyle().Background(nameBg).Foreground(nameFg).Bold(true).PaddingLeft(1).Render(name)
 	nameArrow := lipgloss.NewStyle().Background(theme.BorderColor).Foreground(nameBg).Render("")
 
 	topBarLeft := lipgloss.JoinHorizontal(lipgloss.Top, nameLabel, nameArrow)
@@ -322,5 +346,6 @@ func (m *CallModel) RemovePeer(peerID string) {
 	delete(m.peerFrames, peerID)
 	delete(m.peerStats, peerID)
 	delete(m.peerVolumes, peerID)
+	delete(m.peerDecoders, peerID)
 	m.removedPeers[peerID] = true
 }

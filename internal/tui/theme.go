@@ -57,8 +57,8 @@ var theme = Theme{
 	StatusFg: lipgloss.Color("#c49b95"), // base0A
 	StatsBg:  lipgloss.Color("#1e1f22"), // base02
 
-	VolumeOn:  lipgloss.Color("#7a837c"), // base0B (on)
-	VolumeOff: lipgloss.Color("#554a62"), // base03 (off)
+	VolumeOn:  lipgloss.Color("#e1ffe5"), // base07 — light bars on the sage name label
+	VolumeOff: lipgloss.Color("#101113"), // base00 — dark flat bars when silent
 
 	StatsArrowUp:   lipgloss.Color("#7a837c"), // base0B green
 	StatsArrowDown: lipgloss.Color("#ac7f7b"), // base09 red

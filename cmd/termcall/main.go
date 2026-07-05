@@ -71,13 +71,12 @@ func main() {
 
 	// We wrap the WebRTC connection logic in a function so it can be called
 	// after the user submits the form (if the form is shown).
-	startCall := func(res tui.JoinResult) *tui.CallModel {
+	startCall := func(res tui.JoinResult) (*tui.CallModel, error) {
 		log.Printf("Connecting to %s, Room: %s", res.ServerURL, res.RoomID)
 
 		sigClient, err := signaling.NewClient(ctx, res.ServerURL, res.RoomID, res.Username)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "\n[FATAL] Failed to connect to signaling server: %v\n", err)
-			os.Exit(1)
+			return nil, fmt.Errorf("failed to connect to signaling server: %w", err)
 		}
 		// Notice: we can't easily defer sigClient.Close() here because we are in a closure.
 		// Instead, we let the context cancellation handle it when main exits.
@@ -91,8 +90,7 @@ func main() {
 		cam := capture.NewCamera(15)
 		camChan, err := cam.Start(ctx)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "\n[FATAL] Failed to start camera: %v\nCheck if your camera is connected and if Windows Privacy Settings allow camera access.\n", err)
-			os.Exit(1)
+			return nil, fmt.Errorf("failed to start camera: %v (check the camera is connected and OS privacy settings allow access)", err)
 		}
 
 		mic := capture.NewMicrophone()
@@ -142,7 +140,7 @@ func main() {
 			mesh.Stop()
 		}()
 
-		return callModel
+		return callModel, nil
 	}
 
 	app := tui.NewAppModel(skipForm, *roomID, *username, effectiveServer, startCall)

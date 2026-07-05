@@ -20,11 +20,11 @@ func renderVoiceActivity(rms float64, theme Theme) string {
 
 	bars := []string{" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"}
 	levels := 5 // 5 bars
-	
+
 	// If it's completely silent, show flat lines
 	if rms < 0.005 {
 		silence := lipgloss.NewStyle().Foreground(theme.VolumeOff).Render(strings.Repeat("▁", levels))
-		return " " + silence + " "
+		return " " + silence
 	}
 
 	var sb strings.Builder
@@ -32,7 +32,7 @@ func renderVoiceActivity(rms float64, theme Theme) string {
 		// A simple visualizer effect: center is highest, edges are lower
 		// Distance from center
 		dist := math.Abs(float64(i - levels/2))
-		
+
 		// Value at this bar (0.0 to 1.0)
 		val := scaled - (dist * 0.2)
 		if val < 0.05 {
@@ -52,5 +52,5 @@ func renderVoiceActivity(rms float64, theme Theme) string {
 	}
 
 	active := lipgloss.NewStyle().Foreground(theme.VolumeOn).Render(sb.String())
-	return " " + active + " "
+	return " " + active
 }
