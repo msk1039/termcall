@@ -138,11 +138,16 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.callModel.Init()
 
 	case tea.KeyMsg:
-		// While a connection error is shown, let the user dismiss/quit.
-		if m.currentScreen == screenConnecting && m.connectError != "" {
+		// Allow quitting from the connecting screen — both while the spinner is
+		// active (cancel a slow/stuck connection) and on the error screen.
+		if m.currentScreen == screenConnecting {
 			switch msg.String() {
-			case "q", "ctrl+c", "enter", "esc":
+			case "q", "ctrl+c", "esc":
 				return m, tea.Quit
+			case "enter":
+				if m.connectError != "" {
+					return m, tea.Quit
+				}
 			}
 		}
 
@@ -168,7 +173,14 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	if m.currentScreen == screenHome {
 		hm, cmd := m.homeModel.Update(msg)
-		m.homeModel = hm.(*HomeModel)
+		// If the form just completed, onReady moved us off screenHome. Drop the
+		// home model so later messages (e.g. a resize) don't re-enter the
+		// completed form and strand us back on the connecting screen.
+		if m.currentScreen == screenHome {
+			m.homeModel = hm.(*HomeModel)
+		} else {
+			m.homeModel = nil
+		}
 		return m, cmd
 	}
 	if m.currentScreen == screenConnecting {
