@@ -123,6 +123,39 @@ go build -o termcall-server ./cmd/termcall-server
 
 The server has no CGO dependency, so it builds with plain `go build` — no C toolchain required.
 
+### Run with Docker (Linux VMs)
+
+For hosting on a Linux VM, the included Docker setup is the easiest path. It uses `network_mode: host` so the TURN server can bind its full relay port range (49152–65535) directly to the host — no need to map thousands of UDP ports.
+
+> Docker Desktop on macOS/Windows isn't supported here; `network_mode: host` only behaves correctly on Linux.
+
+1. Clone and configure `.env`:
+   ```bash
+   git clone https://github.com/msk1039/termcall.git
+   cd termcall
+   cp .env.example .env
+   curl -s ifconfig.me   # your server's public IP
+   ```
+   Edit `.env`: set `TERMCALL_PUBLIC_IP` to the address above and change `TERMCALL_TURN_SECRET` to a random string. The full variable reference is in Configure `.env` below.
+
+2. Open the firewall ports (and the cloud firewall, if any):
+   ```bash
+   sudo ./scripts/setup_firewall.sh
+   ```
+
+3. Build and start the server:
+   ```bash
+   docker compose up -d --build
+   ```
+
+4. Verify it's running:
+   ```bash
+   docker ps
+   docker compose logs
+   ```
+
+To secure the WebSocket signaling channel with TLS (recommended for production), see [docs/tls-setup.md](docs/tls-setup.md).
+
 ### Configure `.env`
 
 Copy the template and set your public IP:

@@ -1,0 +1,23 @@
+# Keep .env out of the build context — it holds the TURN secret and public IP.
+# Compose's `env_file:` injects these at runtime, so the file is not needed
+# in the image. Without this, `COPY . .` in the builder stage would leak the
+# secret into an intermediate build layer.
+.env
+
+.git
+.agents
+archive
+build
+diagtest
+docs
+plans
+reference
+skills-lock.json
+*.exe
+*.test
+*.out
+*.log
+debug.log
+*.md
+termcall
+termcall-server

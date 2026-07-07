@@ -1,0 +1,20 @@
+# NOTE: `network_mode: host` only works as expected on Linux. On Docker Desktop
+# for macOS/Windows the container runs inside a VM, so "host" means the VM's
+# host, not your machine — TURN/relay ports won't be reachable from the host
+# loopback the way the Verification Plan expects. For local testing on
+# macOS/Windows, use a compose override that maps a reduced relay range
+# (e.g. 50000-50050) via `ports:` instead, and drop `network_mode: host`.
+# The top-level `version:` key is intentionally omitted — Compose v2 ignores
+# it and prints a deprecation warning when present.
+services:
+  termcall-server:
+    build: .
+    image: termcall-server:latest
+    container_name: termcall-server
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    # Since network_mode is host, we DO NOT define a `ports:` section.
+    # The server binds directly to the host's ports (8080, 3478, 49152-65535)
+    # as defined in the .env file.
