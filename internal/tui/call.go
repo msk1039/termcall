@@ -32,7 +32,9 @@ type CallModel struct {
 	height int
 
 	peers        []string
-	peerFrames   map[string]string
+	peerCells    map[string][][]ascii.Cell
+	peerLegacy   map[string]string
+	peerModes    map[string]ascii.RenderMode
 	peerNames    map[string]string
 	peerStats    map[string]rtc.PeerStats
 	peerVolumes  map[string]float64
@@ -40,7 +42,7 @@ type CallModel struct {
 	peerDecoders map[string]*ascii.DeltaDecoder
 	localVolume  float64
 
-	localFrame []byte
+	localCells [][]ascii.Cell
 	renderer   *ascii.ColorRenderer
 	showStats  bool
 	roomID     string
@@ -54,7 +56,9 @@ func NewCallModel(roomID string, mesh *rtc.MeshManager, camera *capture.Camera, 
 		mic:          mic,
 		camOn:        true,
 		micOn:        true,
-		peerFrames:   make(map[string]string),
+		peerCells:    make(map[string][][]ascii.Cell),
+		peerLegacy:   make(map[string]string),
+		peerModes:    make(map[string]ascii.RenderMode),
 		peerNames:    make(map[string]string),
 		peerStats:    make(map[string]rtc.PeerStats),
 		peerVolumes:  make(map[string]float64),
@@ -127,32 +131,25 @@ func (m *CallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			dec = ascii.NewDeltaDecoder()
 			m.peerDecoders[msg.PeerID] = dec
 		}
-		m.peerFrames[msg.PeerID] = dec.Decode(msg.Frame)
+		cells, mode, isGrid := dec.DecodeCells(msg.Frame)
+		if isGrid {
+			m.peerCells[msg.PeerID] = cells
+			m.peerModes[msg.PeerID] = mode
+		} else {
+			if len(msg.Frame) > 0 && (msg.Frame[0] == 'K' || msg.Frame[0] == 'D') {
+				// failed decode, do nothing
+			} else {
+				m.peerLegacy[msg.PeerID] = msg.Frame
+			}
+		}
 		return m, nil
 	case LocalFrameMsg:
-		totalPeers := len(m.peers) + 1
-		titleH := 1
-		controlH := 3
-		availH := m.height - titleH - controlH
-		if availH < 0 {
-			availH = 0
-		}
-		_, _, _, innerW, innerH := computeGrid(totalPeers, m.width, availH)
-
-		// Cap render size for bandwidth and CPU efficiency.
-		if innerW > maxSendWidth {
-			innerW = maxSendWidth
-		}
-		if innerH > maxSendHeight {
-			innerH = maxSendHeight
-		}
-
 		if m.camOn {
-			displayStr, sendStr := m.renderer.ConvertForSend(msg.RawImage, innerW, innerH)
-			m.localFrame = []byte(displayStr)
+			cells, sendStr := m.renderer.ConvertCells(msg.RawImage, maxSendWidth, maxSendHeight)
+			m.localCells = cells
 			m.mesh.BroadcastFrame([]byte(sendStr))
 		} else {
-			m.localFrame = []byte(m.renderer.Convert(msg.RawImage, innerW, innerH))
+			m.localCells = nil
 		}
 		return m, nil
 	case StatsTickMsg:
@@ -250,9 +247,14 @@ func (m *CallModel) View() string {
 	var cells []string
 
 	// Local cell
-	localFrameStr := string(m.localFrame)
+	localFrameStr := ""
 	if !m.camOn {
 		localFrameStr = "Camera Off"
+	} else if m.localCells != nil {
+		upscaled := ascii.UpscaleCells(m.localCells, innerW, innerH)
+		localFrameStr = ascii.SerialiseMode(upscaled, m.renderer.GetMode())
+	} else {
+		localFrameStr = "Waiting for camera..."
 	}
 	localName := "You (Local)" + renderVoiceActivity(m.localVolume, theme)
 
@@ -266,8 +268,14 @@ func (m *CallModel) View() string {
 	// Remote cells
 	for _, p := range m.peers {
 		name := m.peerNames[p] + renderVoiceActivity(m.peerVolumes[p], theme)
-		frame := m.peerFrames[p]
-		if frame == "" {
+		var frame string
+		if cells, ok := m.peerCells[p]; ok && cells != nil {
+			mode := m.peerModes[p]
+			upscaled := ascii.UpscaleCells(cells, innerW, innerH)
+			frame = ascii.SerialiseMode(upscaled, mode)
+		} else if legacy, ok := m.peerLegacy[p]; ok {
+			frame = legacy
+		} else {
 			frame = "Waiting for video..."
 		}
 
@@ -343,7 +351,9 @@ func (m *CallModel) RemovePeer(peerID string) {
 		}
 	}
 	delete(m.peerNames, peerID)
-	delete(m.peerFrames, peerID)
+	delete(m.peerCells, peerID)
+	delete(m.peerLegacy, peerID)
+	delete(m.peerModes, peerID)
 	delete(m.peerStats, peerID)
 	delete(m.peerVolumes, peerID)
 	delete(m.peerDecoders, peerID)

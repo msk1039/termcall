@@ -104,6 +104,19 @@ func (r *ColorRenderer) serialise(cells [][]Cell) string {
 	return ""
 }
 
+// SerialiseMode converts a cell grid to an ANSI string for a given mode.
+func SerialiseMode(cells [][]Cell, mode RenderMode) string {
+	switch mode {
+	case ModeASCII:
+		return serialiseASCII(cells)
+	case ModeColor256:
+		return serialiseColor256(cells)
+	case ModeHalfBlock:
+		return serialiseHalfBlock(cells)
+	}
+	return ""
+}
+
 // Convert renders an image to a full ANSI display string (noise-suppressed).
 // This is the display path; it does not delta-encode.
 func (r *ColorRenderer) Convert(img image.Image, targetWidth, targetHeight int) string {
@@ -126,6 +139,21 @@ func (r *ColorRenderer) ConvertForSend(img image.Image, w, h int) (displayStr, s
 		sendStr = r.delta.Encode(cells)
 	} else {
 		sendStr = displayStr
+	}
+	return
+}
+
+// ConvertCells renders an image to a stabilised cell grid and delta-encoded
+// send string. The cell grid can be upscaled at display time.
+func (r *ColorRenderer) ConvertCells(img image.Image, w, h int) (cells [][]Cell, sendStr string) {
+	cells = r.renderCells(img, w, h)
+	if r.stabiliser != nil {
+		cells = r.stabiliser.Stabilise(cells)
+	}
+	if r.delta != nil {
+		sendStr = r.delta.Encode(cells)
+	} else {
+		sendStr = r.serialise(cells)
 	}
 	return
 }

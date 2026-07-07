@@ -150,20 +150,39 @@ func (d *DeltaDecoder) Decode(data string) string {
 	}
 }
 
-func (d *DeltaDecoder) decodeKeyframe(data string) string {
+// DecodeCells parses a wire frame and returns the raw cell grid + its mode.
+// For legacy plain-ANSI payloads, returns nil (caller should display as-is).
+func (d *DeltaDecoder) DecodeCells(data string) ([][]Cell, RenderMode, bool) {
+	if data == "" {
+		return nil, 0, false
+	}
+	switch data[0] {
+	case 'K':
+		if d.decodeKeyframeInto(data) {
+			return deepCopyCells(d.grid), d.mode, d.has
+		}
+	case 'D':
+		if d.decodeDeltaInto(data) {
+			return deepCopyCells(d.grid), d.mode, d.has
+		}
+	}
+	return nil, 0, false
+}
+
+func (d *DeltaDecoder) decodeKeyframeInto(data string) bool {
 	nl := strings.IndexByte(data, '\n')
 	if nl < 0 {
-		return data
+		return false
 	}
 	parts := strings.Fields(data[:nl])
 	if len(parts) < 4 {
-		return data
+		return false
 	}
 	w, err1 := strconv.Atoi(parts[1])
 	h, err2 := strconv.Atoi(parts[2])
 	mode, err3 := strconv.Atoi(parts[3])
 	if err1 != nil || err2 != nil || err3 != nil || w <= 0 || h <= 0 {
-		return data
+		return false
 	}
 
 	d.w, d.h, d.mode, d.has = w, h, RenderMode(mode), true
@@ -184,27 +203,34 @@ func (d *DeltaDecoder) decodeKeyframe(data string) string {
 		}
 	}
 	d.grid = grid
+	return true
+}
+
+func (d *DeltaDecoder) decodeKeyframe(data string) string {
+	if !d.decodeKeyframeInto(data) {
+		return data
+	}
 	return d.serialise()
 }
 
-func (d *DeltaDecoder) decodeDelta(data string) string {
+func (d *DeltaDecoder) decodeDeltaInto(data string) bool {
 	nl := strings.IndexByte(data, '\n')
 	if nl < 0 {
-		return data
+		return false
 	}
 	parts := strings.Fields(data[:nl])
 	if len(parts) < 4 {
-		return data
+		return false
 	}
 	w, err1 := strconv.Atoi(parts[1])
 	h, err2 := strconv.Atoi(parts[2])
 	count, err3 := strconv.Atoi(parts[3])
 	if err1 != nil || err2 != nil || err3 != nil {
-		return data
+		return false
 	}
 	if !d.has || d.w != w || d.h != h || d.grid == nil {
 		// Delta without a matching keyframe — cannot apply safely.
-		return ""
+		return false
 	}
 	r := bufio.NewReader(strings.NewReader(data[nl+1:]))
 	for i := 0; i < count; i++ {
@@ -229,7 +255,31 @@ func (d *DeltaDecoder) decodeDelta(data string) string {
 		}
 		d.grid[row][col] = Cell{Char: byte(ch), Fg: fg, Bg: bg}
 	}
-	return d.serialise()
+	return true
+}
+
+func (d *DeltaDecoder) decodeDelta(data string) string {
+	nl := strings.IndexByte(data, '\n')
+	if nl < 0 {
+		return data
+	}
+	parts := strings.Fields(data[:nl])
+	if len(parts) < 4 {
+		return data
+	}
+	w, err1 := strconv.Atoi(parts[1])
+	h, err2 := strconv.Atoi(parts[2])
+	_, err3 := strconv.Atoi(parts[3])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return data
+	}
+	if !d.has || d.w != w || d.h != h || d.grid == nil {
+		return ""
+	}
+	if d.decodeDeltaInto(data) {
+		return d.serialise()
+	}
+	return ""
 }
 
 func (d *DeltaDecoder) serialise() string {
