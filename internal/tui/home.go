@@ -60,11 +60,11 @@ var cfg = struct {
 	// glyph (e.g. "w", "*", "#", "░", "·"). Empty = use the texture's own.
 	CloudCharBright string
 }{
-	RotationSpeed:     0.5,
-	CamOrbitSpeed:     1,
-	TiltX:             0.6,
-	TiltY:             -0.2,
-	TiltZ:             0,
+	RotationSpeed:     0.6,
+	CamOrbitSpeed:     0.3,
+	TiltX:             0.1,
+	TiltY:             -0.4,
+	TiltZ:             -0.8,
 	Zoom:              1.4,
 	CanvasScale:       1.9,
 	OffsetX:           -10,
@@ -284,7 +284,7 @@ func (m *HomeModel) currentFieldIndex() int {
 
 func NewHomeModel(onReady func(JoinResult) tea.Cmd) *HomeModel {
 	var roomID, username, serverURL string
-	serverURL = DefaultServerURL
+	serverURL = ""
 
 	form := huh.NewForm(
 		huh.NewGroup(
