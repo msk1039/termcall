@@ -6,17 +6,45 @@ func computeGrid(peerCount, termW, termH int) (cols, boxW, boxH, innerW, innerH 
 		return 1, termW, termH, 40, 15
 	}
 
-	cols = 1
-	switch {
-	case peerCount == 1:
-		cols = 1
-	case peerCount <= 4:
-		cols = 2
-	default:
-		cols = 3
+	bestCols := 1
+	bestRows := peerCount
+	bestScore := -1
+
+	for c := 1; c <= peerCount; c++ {
+		r := (peerCount + c - 1) / c
+
+		bW := termW / c
+		bH := termH / r
+
+		maxIW := bW - 2
+		maxIH := bH - 3 // marginV(2) + topbar(1)
+
+		if maxIW < 10 {
+			maxIW = 10
+		}
+		if maxIH < 5 {
+			maxIH = 5
+		}
+
+		score := maxIW * maxIH
+
+		// Heavy penalty if we can't fit the canonical maxSendWidth
+		if maxIW >= maxSendWidth {
+			score += 1000000
+		} else {
+			// If we must squash, heavily prioritize wider layouts to minimize cutoff
+			score += maxIW * 1000
+		}
+
+		if score > bestScore {
+			bestScore = score
+			bestCols = c
+			bestRows = r
+		}
 	}
 
-	rows := (peerCount + cols - 1) / cols
+	cols = bestCols
+	rows := bestRows
 
 	// Calculate outer bounding box for each cell
 	boxW = termW / cols
@@ -40,20 +68,11 @@ func computeGrid(peerCount, termW, termH int) (cols, boxW, boxH, innerW, innerH 
 		maxInnerH = 5
 	}
 
-	// For a landscape video feed (e.g. 4:3), and terminal chars being 2x taller than wide:
-	// Real aspect ratio = (innerW * 1) / (innerH * 2) = 4 / 3
-	// innerW / innerH = 8 / 3  =>  innerH = innerW * 3 / 8
-	
-	targetH := maxInnerW * 3 / 8
+	// We no longer constrain targetW and targetH by aspect ratio.
+	// The UpscaleCells function will crop-to-fit (cover) the video to fill
+	// this entire space, maximizing screen usage.
 	targetW := maxInnerW
+	targetH := maxInnerH
 
-	if targetH > maxInnerH {
-		// Constrained by height, so calculate width based on height
-		targetH = maxInnerH
-		targetW = targetH * 8 / 3
-	}
-
-	// targetW/targetH are the video dimensions.
-	// For margins, we'll return the original boxW/boxH, but the caller will render cells smaller.
 	return cols, boxW, boxH, targetW, targetH
 }

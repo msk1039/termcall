@@ -251,8 +251,7 @@ func (m *CallModel) View() string {
 	if !m.camOn {
 		localFrameStr = "Camera Off"
 	} else if m.localCells != nil {
-		upscaled := ascii.UpscaleCells(m.localCells, innerW, innerH)
-		localFrameStr = ascii.SerialiseMode(upscaled, m.renderer.GetMode())
+		localFrameStr = ascii.SerialiseMode(m.localCells, m.renderer.GetMode())
 	} else {
 		localFrameStr = "Waiting for camera..."
 	}
@@ -271,8 +270,7 @@ func (m *CallModel) View() string {
 		var frame string
 		if cells, ok := m.peerCells[p]; ok && cells != nil {
 			mode := m.peerModes[p]
-			upscaled := ascii.UpscaleCells(cells, innerW, innerH)
-			frame = ascii.SerialiseMode(upscaled, mode)
+			frame = ascii.SerialiseMode(cells, mode)
 		} else if legacy, ok := m.peerLegacy[p]; ok {
 			frame = legacy
 		} else {
@@ -304,6 +302,17 @@ func (m *CallModel) View() string {
 }
 
 func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInnerH int, theme Theme) string {
+	lines := strings.Split(frame, "\n")
+	if len(lines) > maxInnerH {
+		lines = lines[:maxInnerH]
+	}
+	safeFrame := strings.Join(lines, "\n")
+
+	actualW := lipgloss.Width(safeFrame)
+	if actualW == 0 || actualW > maxInnerW {
+		actualW = maxInnerW
+	}
+
 	nameBg := theme.ActiveBtnBg
 	nameFg := theme.ActiveBtnFg
 
@@ -318,7 +327,7 @@ func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInne
 		topBarRight = lipgloss.JoinHorizontal(lipgloss.Top, statsArrow, statsStr)
 	}
 
-	fillerW := maxInnerW - lipgloss.Width(topBarLeft) - lipgloss.Width(topBarRight)
+	fillerW := actualW - lipgloss.Width(topBarLeft) - lipgloss.Width(topBarRight)
 	if fillerW < 0 {
 		fillerW = 0
 	}
@@ -326,13 +335,7 @@ func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInne
 
 	topBar := lipgloss.JoinHorizontal(lipgloss.Top, topBarLeft, filler, topBarRight)
 
-	lines := strings.Split(frame, "\n")
-	if len(lines) > maxInnerH {
-		lines = lines[:maxInnerH]
-	}
-	safeFrame := strings.Join(lines, "\n")
-
-	content := lipgloss.JoinVertical(lipgloss.Left, topBar, safeFrame)
+	content := lipgloss.JoinVertical(lipgloss.Center, topBar, safeFrame)
 	return lipgloss.Place(boxW, boxH, lipgloss.Center, lipgloss.Center, content)
 }
 

@@ -59,6 +59,16 @@ func serialiseColor256(cells [][]Cell) string {
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			c := cells[y][x]
+			
+			if c.Char == ' ' {
+				if lastFg != -1 {
+					sb.WriteString("\x1b[0m")
+					lastFg = -1
+				}
+				sb.WriteByte(' ')
+				continue
+			}
+
 			if c.Fg != lastFg {
 				fmt.Fprintf(&sb, "\x1b[38;5;%dm", c.Fg)
 				lastFg = c.Fg

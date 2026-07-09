@@ -62,6 +62,17 @@ func serialiseHalfBlock(cells [][]Cell) string {
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			c := cells[y][x]
+			
+			if c.Char == ' ' {
+				if lastBg != -1 || lastFg != -1 {
+					sb.WriteString("\x1b[0m")
+					lastBg = -1
+					lastFg = -1
+				}
+				sb.WriteString(" ")
+				continue
+			}
+
 			if c.Bg != lastBg {
 				fmt.Fprintf(&sb, "\x1b[48;5;%dm", c.Bg)
 				lastBg = c.Bg
