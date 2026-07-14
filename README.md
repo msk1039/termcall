@@ -122,6 +122,8 @@ There are two ways to start a call.
 ```
 
 You'll get a join screen — type a username, room ID, and server URL (pre-filled with a default), move between fields with ↑/↓, and press enter to join.
+<img width="1440" height="873" alt="Screenshot 2026-07-15 at 2 32 28 AM" src="https://github.com/user-attachments/assets/088ff2d4-c0fd-455b-89be-7407a1d8cbb8" />
+
 
 **2. Flags.** Skip the form by passing a username, room name and backend server url
 
