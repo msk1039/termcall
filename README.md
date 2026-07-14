@@ -4,11 +4,28 @@ TermCall is a terminal video call client. Start it, pick a username and a room, 
 
 It's WebRTC under the hood: a signaling server introduces peers, then audio and video stream directly between them (full mesh, no media server in the middle). Frames get downsampled and drawn with half-block characters and ANSI color, so it works in any truecolor terminal.
 
-The features that set TermCall apart:
+https://github.com/user-attachments/assets/e4fcb05c-7089-4a93-8465-0f8415fcb790
 
+## Table of Contents
+
+- [Features](#features)
+- [Install](#install)
+  - [Precompiled binaries](#precompiled-binaries)
+  - [Building the client from source](#building-the-client-from-source)
+- [Usage](#usage)
+- [Self-hosting the server](#self-hosting-the-server)
+  - [Run with Docker (Linux VMs)](#run-with-docker-linux-vms)
+  - [Configure `.env`](#configure-env)
+  - [Open the firewall ports](#open-the-firewall-ports)
+  - [Point clients at it](#point-clients-at-it)
+
+## Features
+
+- Reliable NAT traversal: when direct peer-to-peer connections fail (symmetric NATs, restrictive firewalls, hotel/corporate Wi-Fi), a bundled self-hostable TURN server relays packets so calls still connect when peers can't reach each other directly
+- A self-hostable backend server: `termcall-server` runs the signaling server and TURN relay in one process — host it yourself on any Linux VPS with a single `docker compose up -d` command, no C toolchain or manual binary build required
+- Public test server available: skip self-hosting and try TermCall right away at `ws://termcall-server.m4yank.com:8080/ws` — the maintainer runs a live instance for anyone to join a room and see it work
 - Peer-to-peer video calls rendered as colored ASCII / half-block art, right in the terminal
 - Full-mesh WebRTC: audio and video flow directly between peers once they're introduced
-- A TUI join screen with a live spinning ASCII globe behind the form
 - Three render modes — ASCII, Color256, HalfBlock (HalfBlock by default)
 - Live per-peer stats: bandwidth, packet loss, and ping
 - Mic and camera toggles, mute state, and voice-activity bars
@@ -27,41 +44,22 @@ chmod +x termcall
 ./termcall
 ```
 
-### Building from source
+### Building the client from source
 
 To build TermCall from source you need:
 
 - **Go 1.25+** (the version in `go.mod` or greater).
 - **CGO** enabled (required for camera and microphone access via `mediadevices`).
+- A working C compiler toolchain — see the platform-specific guide below.
 
-#### macOS
+<details>
+<summary>macOS</summary>
 
-Install the Xcode command line tools for CGO:
+**Prerequisites**
 
-```bash
-xcode-select --install
-```
+- **Xcode Command Line Tools** — provides the C compiler CGO links against. Install via `xcode-select --install` from the Terminal, or from Apple's developer downloads.
 
-#### Windows
-
-Building on Windows requires a 64-bit GCC toolchain for CGO.
-
-**Option 1: TDM-GCC (recommended)**
-1. Download [TDM-GCC 64-bit](https://jmeubank.github.io/tdm-gcc/download/) — pick the `tdm64` version, not 32-bit.
-2. Run the installer and keep the option that adds it to your PATH.
-3. Restart your terminal.
-
-**Option 2: MSYS2**
-1. Install [MSYS2](https://www.msys2.org/).
-2. In the **MSYS2 UCRT64** terminal run:
-   ```bash
-   pacman -S mingw-w64-ucrt-x86_64-gcc
-   ```
-3. Add `C:\msys64\ucrt64\bin` to your system PATH and restart your terminal.
-
-> If you hit `cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`, you're on a 32-bit `gcc`. Remove any old 32-bit MinGW from your PATH, install a 64-bit compiler (TDM-GCC 64), and make sure it's first in PATH. Verify with `gcc -v` — it should say `Target: x86_64...`.
-
-Then clone and build:
+**Build and run**
 
 ```bash
 git clone https://github.com/msk1039/termcall.git
@@ -77,6 +75,42 @@ Or just run it directly without producing a binary:
 go run ./cmd/termcall
 ```
 
+</details>
+
+<details>
+<summary>Windows</summary>
+
+**Prerequisites**
+
+You need a 64-bit GCC toolchain for CGO. Pick one of the following:
+
+- **TDM-GCC 64-bit** (recommended) — download the `tdm64` installer from https://jmeubank.github.io/tdm-gcc/download/ (not the 32-bit version), run it, and keep the option that adds it to your PATH.
+- **MSYS2** — install from https://www.msys2.org/, then in the **MSYS2 UCRT64** terminal run:
+  ```bash
+  pacman -S mingw-w64-ucrt-x86_64-gcc
+  ```
+  and add `C:\msys64\ucrt64\bin` to your system PATH.
+
+Verify with `gcc -v` — the `Target:` line should say `x86_64...`.
+
+> If you hit `cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`, you're on a 32-bit `gcc`. Remove any old 32-bit MinGW from your PATH, install a 64-bit compiler (TDM-GCC 64), and make sure it's first in PATH.
+
+**Build and run**
+
+From PowerShell (the env vars are required so `go build` uses CGO and targets amd64):
+
+```powershell
+git clone https://github.com/msk1039/termcall.git
+cd termcall
+$env:GOARCH="amd64"
+$env:CGO_ENABLED=1
+go mod tidy
+go build -o termcall.exe ./cmd/termcall
+./termcall.exe
+```
+
+</details>
+
 ## Usage
 
 There are two ways to start a call.
@@ -89,14 +123,12 @@ There are two ways to start a call.
 
 You'll get a join screen — type a username, room ID, and server URL (pre-filled with a default), move between fields with ↑/↓, and press enter to join.
 
-**2. Flags.** Skip the form by passing a username and a room. The server URL is optional and defaults to `ws://13.127.137.230:8080/ws`:
+**2. Flags.** Skip the form by passing a username, room name and backend server url
 
 ```bash
 ./termcall -username alice -room my-room
 ./termcall -username alice -room my-room -server ws://localhost:8080/ws
 ```
-
-If you pass some flags but not both `-username` and `-room`, TermCall will ask you to pass all the arguments and print the usage.
 
 Once you're in a call:
 
@@ -109,19 +141,6 @@ Once you're in a call:
 ## Self-hosting the server
 
 TermCall needs a signaling + TURN server to pair peers and relay media when direct connections fail. The `termcall-server` binary runs both in one process, and you can host it on any Linux VPS with a public IP.
-
-### Build the server
-
-On your VPS (or locally, then copy the binary over):
-
-```bash
-git clone https://github.com/msk1039/termcall.git
-cd termcall
-go mod tidy
-go build -o termcall-server ./cmd/termcall-server
-```
-
-The server has no CGO dependency, so it builds with plain `go build` — no C toolchain required.
 
 ### Run with Docker (Linux VMs)
 
@@ -136,7 +155,7 @@ For hosting on a Linux VM, the included Docker setup is the easiest path. It use
    cp .env.example .env
    curl -s ifconfig.me   # your server's public IP
    ```
-   Edit `.env`: set `TERMCALL_PUBLIC_IP` to the address above and change `TERMCALL_TURN_SECRET` to a random string. The full variable reference is in Configure `.env` below.
+   Edit `.env`: set `TERMCALL_PUBLIC_IP` to the address above and change `TERMCALL_TURN_SECRET` to a random string. The full variable reference is in [Configure `.env`](#configure-env) below.
 
 2. Open the firewall ports (and the cloud firewall, if any):
    ```bash
@@ -178,14 +197,6 @@ sudo ./scripts/setup_firewall.sh
 > If your VPS has a cloud firewall too (AWS Security Groups, Hetzner, DigitalOcean, etc.), open the same ports there — the script only configures the OS-level firewall.
 
 > On restrictive networks (some mobile carriers, corporate Wi-Fi), TURN on port 443 reaches clients that block 3478. Set `TERMCALL_TURN_PORT=443` in `.env` if you run into that.
-
-### Run the server
-
-```bash
-./termcall-server
-```
-
-The startup log lists the WebSocket port, TURN port, relay range, public IP, and max room size. Run it under `tmux` or `systemd` so it stays up.
 
 ### Point clients at it
 
