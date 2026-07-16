@@ -30,6 +30,3 @@ skills-lock.json
 *.md
 !README.md
 /reference
-
-
-Jenkinsfile
