@@ -6,6 +6,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/msk1039/termcall/internal/protocol"
 )
 
 type JoinResult struct {
@@ -28,8 +29,8 @@ func NewJoinModel(onReady func(JoinResult) tea.Cmd) *JoinModel {
 				Title("Room ID").
 				Value(&roomID).
 				Validate(func(s string) error {
-					if len(s) == 0 {
-						return errors.New("room ID cannot be empty")
+					if err := protocol.ValidateRoomID(s); err != nil {
+						return errors.New("room ID must be 'new' or a room UUID")
 					}
 					return nil
 				}),

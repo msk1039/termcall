@@ -21,6 +21,8 @@ type Theme struct {
 	PeerLabelFg    lipgloss.Color
 	StatusFg       lipgloss.Color
 	StatsBg        lipgloss.Color
+	CameraOffBg    lipgloss.Color
+	CameraOffFg    lipgloss.Color
 	VolumeOn       lipgloss.Color
 	VolumeOff      lipgloss.Color
 	StatsArrowUp   lipgloss.Color
@@ -56,6 +58,10 @@ var theme = Theme{
 	// Stats panel: warm peach text on a dark panel.
 	StatusFg: lipgloss.Color("#c49b95"), // base0A
 	StatsBg:  lipgloss.Color("#1e1f22"), // base02
+
+	// Camera-off placeholders reserve the video frame's full area.
+	CameraOffBg: lipgloss.Color("#4a4a4a"),
+	CameraOffFg: lipgloss.Color("#e1ffe5"),
 
 	VolumeOn:  lipgloss.Color("#e1ffe5"), // base07 — light bars on the sage name label
 	VolumeOff: lipgloss.Color("#101113"), // base00 — dark flat bars when silent

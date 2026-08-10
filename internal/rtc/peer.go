@@ -1,30 +1,47 @@
 package rtc
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/msk1039/termcall/internal/playback"
 	"github.com/pion/webrtc/v4"
+	"golang.org/x/time/rate"
 )
 
+const maxPendingICECandidates = 256
+
+const maxRemoteFrameRate = rate.Limit(30)
+
+var ErrPeerClosed = errors.New("remote peer is closed")
+
 type RemotePeer struct {
-	lastSeq       atomic.Uint64
-	PeerID        string
-	Username      string
-	PC            *webrtc.PeerConnection
-	DataChan      *webrtc.DataChannel // For ASCII frames
-	ControlChan   *webrtc.DataChannel // For reliable control messages
-	AudioTrack    *webrtc.TrackRemote // Incoming audio
-	AudioSender   *webrtc.RTPSender   // Outgoing audio sender (for muting)
-	Player        *playback.Player    // Playback engine
-	LastFrame     string              // Latest ASCII frame for rendering
-	Stats         PeerStats
-	prevVideoSent uint64
-	prevVideoRecv uint64
-	prevAudioSent uint64
-	prevAudioRecv uint64
-	mu            sync.RWMutex
+	lastSeq  atomic.Uint64
+	PeerID   string
+	Username string
+	PC       *webrtc.PeerConnection
+
+	AudioSender *webrtc.RTPSender
+	AudioTrack  *webrtc.TrackRemote
+
+	dataChannel          *webrtc.DataChannel
+	player               *playback.Player
+	lastFrame            string
+	stats                PeerStats
+	pendingICE           []webrtc.ICECandidateInit
+	remoteDescriptionSet bool
+	prevVideoSent        uint64
+	prevVideoRecv        uint64
+	prevAudioSent        uint64
+	prevAudioRecv        uint64
+	prevDataSent         uint64
+	prevDataRecv         uint64
+	mu                   sync.RWMutex
+	closeOnce            sync.Once
+	closed               bool
+	frameLimiter         *rate.Limiter
 }
 
 type PeerStats struct {
@@ -40,93 +57,223 @@ type PeerStats struct {
 	ConnectionState string
 }
 
-func (rp *RemotePeer) UpdateFrame(frame string) {
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-	rp.LastFrame = frame
+func (peer *RemotePeer) SetDataChannel(channel *webrtc.DataChannel) bool {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.closed {
+		return false
+	}
+	peer.dataChannel = channel
+	return true
 }
 
-func (rp *RemotePeer) GetFrame() string {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-	return rp.LastFrame
+func (peer *RemotePeer) DataChannel() *webrtc.DataChannel {
+	peer.mu.RLock()
+	defer peer.mu.RUnlock()
+	return peer.dataChannel
 }
 
-// CompareAndUpdateSeq returns true if seq is newer than the last seen sequence
-// number for this peer and updates the stored value. Returns false if the frame
-// is stale (older than one already processed), so the caller can drop it. It is
-// lock-free since the DataChannel OnMessage path is hot.
-func (rp *RemotePeer) CompareAndUpdateSeq(seq uint64) bool {
+func (peer *RemotePeer) SetPlayer(player *playback.Player) (*playback.Player, bool) {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.closed {
+		return nil, false
+	}
+	previous := peer.player
+	peer.player = player
+	return previous, true
+}
+
+func (peer *RemotePeer) ClearPlayer(player *playback.Player) {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.player == player {
+		peer.player = nil
+	}
+}
+
+func (peer *RemotePeer) Player() *playback.Player {
+	peer.mu.RLock()
+	defer peer.mu.RUnlock()
+	return peer.player
+}
+
+func (peer *RemotePeer) UpdateFrame(frame string) {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	peer.lastFrame = frame
+}
+
+func (peer *RemotePeer) GetFrame() string {
+	peer.mu.RLock()
+	defer peer.mu.RUnlock()
+	return peer.lastFrame
+}
+
+func (peer *RemotePeer) StatsSnapshot() PeerStats {
+	peer.mu.RLock()
+	defer peer.mu.RUnlock()
+	return peer.stats
+}
+
+func (peer *RemotePeer) CompareAndUpdateSeq(sequence uint64) bool {
 	for {
-		old := rp.lastSeq.Load()
-		if seq <= old {
+		oldSequence := peer.lastSeq.Load()
+		if sequence <= oldSequence {
 			return false
 		}
-		if rp.lastSeq.CompareAndSwap(old, seq) {
+		if peer.lastSeq.CompareAndSwap(oldSequence, sequence) {
 			return true
 		}
 	}
 }
 
-func (rp *RemotePeer) Close() {
-	if rp.PC != nil {
-		rp.PC.Close()
+func (peer *RemotePeer) AllowFrame() bool {
+	peer.mu.Lock()
+	if peer.frameLimiter == nil {
+		peer.frameLimiter = rate.NewLimiter(maxRemoteFrameRate, 2)
 	}
+	limiter := peer.frameLimiter
+	closed := peer.closed
+	peer.mu.Unlock()
+	return !closed && limiter.Allow()
 }
 
-func (rp *RemotePeer) UpdateStats(intervalSeconds float64) {
-	if rp.PC == nil || rp.PC.ConnectionState() != webrtc.PeerConnectionStateConnected {
+func (peer *RemotePeer) AddICECandidate(candidate webrtc.ICECandidateInit) error {
+	peer.mu.Lock()
+	if peer.closed {
+		peer.mu.Unlock()
+		return ErrPeerClosed
+	}
+	if !peer.remoteDescriptionSet {
+		if len(peer.pendingICE) >= maxPendingICECandidates {
+			peer.mu.Unlock()
+			return fmt.Errorf("too many pending ICE candidates (maximum %d)", maxPendingICECandidates)
+		}
+		peer.pendingICE = append(peer.pendingICE, candidate)
+		peer.mu.Unlock()
+		return nil
+	}
+	peer.mu.Unlock()
+	return peer.PC.AddICECandidate(candidate)
+}
+
+func (peer *RemotePeer) SetRemoteDescription(description webrtc.SessionDescription) error {
+	peer.mu.RLock()
+	closed := peer.closed
+	connection := peer.PC
+	peer.mu.RUnlock()
+	if closed {
+		return ErrPeerClosed
+	}
+	if connection == nil {
+		return errors.New("remote peer has no peer connection")
+	}
+	if err := connection.SetRemoteDescription(description); err != nil {
+		return err
+	}
+
+	peer.mu.Lock()
+	peer.remoteDescriptionSet = true
+	pending := append([]webrtc.ICECandidateInit{}, peer.pendingICE...)
+	peer.pendingICE = []webrtc.ICECandidateInit{}
+	peer.mu.Unlock()
+
+	var candidateErrors []error
+	for _, candidate := range pending {
+		if err := connection.AddICECandidate(candidate); err != nil {
+			candidateErrors = append(candidateErrors, err)
+		}
+	}
+	return errors.Join(candidateErrors...)
+}
+
+func (peer *RemotePeer) Close() {
+	peer.closeOnce.Do(func() {
+		peer.mu.Lock()
+		peer.closed = true
+		player := peer.player
+		peer.player = nil
+		connection := peer.PC
+		peer.pendingICE = nil
+		peer.mu.Unlock()
+		if player != nil {
+			player.Close()
+		}
+		if connection != nil {
+			_ = connection.Close()
+		}
+	})
+}
+
+func (peer *RemotePeer) UpdateStats(intervalSeconds float64) {
+	if peer.PC == nil || peer.PC.ConnectionState() != webrtc.PeerConnectionStateConnected {
+		return
+	}
+	if intervalSeconds <= 0 {
 		return
 	}
 
-	stats := rp.PC.GetStats()
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-
-	rp.Stats.ConnectionState = rp.PC.ConnectionState().String()
+	stats := peer.PC.GetStats()
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	peer.stats.ConnectionState = peer.PC.ConnectionState().String()
 
 	for _, stat := range stats {
-		switch s := stat.(type) {
+		switch typed := stat.(type) {
 		case webrtc.OutboundRTPStreamStats:
-			if s.Kind == "video" {
-				delta := s.BytesSent - rp.prevVideoSent
-				rp.Stats.OutgoingKBps = float64(delta) / 1024.0 / intervalSeconds
-				rp.prevVideoSent = s.BytesSent
-			} else if s.Kind == "audio" {
-				delta := s.BytesSent - rp.prevAudioSent
-				rp.Stats.AudioOutKBps = float64(delta) / 1024.0 / intervalSeconds
-				rp.prevAudioSent = s.BytesSent
+			switch typed.Kind {
+			case "video":
+				delta := counterDelta(typed.BytesSent, peer.prevVideoSent)
+				peer.stats.OutgoingKBps = bytesPerSecondToKBps(delta, intervalSeconds)
+				peer.prevVideoSent = typed.BytesSent
+			case "audio":
+				delta := counterDelta(typed.BytesSent, peer.prevAudioSent)
+				peer.stats.AudioOutKBps = bytesPerSecondToKBps(delta, intervalSeconds)
+				peer.prevAudioSent = typed.BytesSent
 			}
 		case webrtc.InboundRTPStreamStats:
-			if s.Kind == "video" {
-				delta := s.BytesReceived - rp.prevVideoRecv
-				rp.Stats.IncomingKBps = float64(delta) / 1024.0 / intervalSeconds
-				rp.prevVideoRecv = s.BytesReceived
-			} else if s.Kind == "audio" {
-				delta := s.BytesReceived - rp.prevAudioRecv
-				rp.Stats.AudioInKBps = float64(delta) / 1024.0 / intervalSeconds
-				rp.prevAudioRecv = s.BytesReceived
-				rp.Stats.PacketsLost = uint32(s.PacketsLost)
-				rp.Stats.Jitter = s.Jitter
+			switch typed.Kind {
+			case "video":
+				delta := counterDelta(typed.BytesReceived, peer.prevVideoRecv)
+				peer.stats.IncomingKBps = bytesPerSecondToKBps(delta, intervalSeconds)
+				peer.prevVideoRecv = typed.BytesReceived
+			case "audio":
+				delta := counterDelta(typed.BytesReceived, peer.prevAudioRecv)
+				peer.stats.AudioInKBps = bytesPerSecondToKBps(delta, intervalSeconds)
+				peer.prevAudioRecv = typed.BytesReceived
+				peer.stats.PacketsLost = 0
+				if typed.PacketsLost > 0 {
+					peer.stats.PacketsLost = uint32(typed.PacketsLost)
+				}
+				peer.stats.Jitter = typed.Jitter
 			}
 		case webrtc.ICECandidatePairStats:
-			if s.State == webrtc.StatsICECandidatePairStateSucceeded {
-				rp.Stats.RTTMs = s.CurrentRoundTripTime * 1000.0
+			if typed.State == webrtc.StatsICECandidatePairStateSucceeded {
+				peer.stats.RTTMs = typed.CurrentRoundTripTime * 1000
 			}
+		case webrtc.DataChannelStats:
+			if typed.Label != "video-ascii" {
+				continue
+			}
+			deltaSent := counterDelta(typed.BytesSent, peer.prevDataSent)
+			peer.stats.OutgoingKBps = bytesPerSecondToKBps(deltaSent, intervalSeconds)
+			peer.prevDataSent = typed.BytesSent
+
+			deltaReceived := counterDelta(typed.BytesReceived, peer.prevDataRecv)
+			peer.stats.IncomingKBps = bytesPerSecondToKBps(deltaReceived, intervalSeconds)
+			peer.prevDataRecv = typed.BytesReceived
 		}
 	}
+}
 
-	// DataChannels don't show up in RTPStats.
-	// To get data channel stats we need to check DataChannelStats.
-	for _, stat := range stats {
-		if s, ok := stat.(webrtc.DataChannelStats); ok && s.Label == "video-ascii" {
-			deltaSent := s.BytesSent - rp.prevVideoSent
-			rp.Stats.OutgoingKBps = float64(deltaSent) / 1024.0 / intervalSeconds
-			rp.prevVideoSent = s.BytesSent
+func bytesPerSecondToKBps(bytes uint64, seconds float64) float64 {
+	return float64(bytes) / 1024 / seconds
+}
 
-			deltaRecv := s.BytesReceived - rp.prevVideoRecv
-			rp.Stats.IncomingKBps = float64(deltaRecv) / 1024.0 / intervalSeconds
-			rp.prevVideoRecv = s.BytesReceived
-		}
+func counterDelta(current, previous uint64) uint64 {
+	if current < previous {
+		return current
 	}
+	return current - previous
 }

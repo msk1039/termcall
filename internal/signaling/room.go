@@ -2,142 +2,242 @@ package signaling
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/msk1039/termcall/internal/protocol"
-	"nhooyr.io/websocket"
+)
+
+var (
+	ErrRoomFull      = errors.New("room is full")
+	ErrPeerNotFound  = errors.New("peer not found")
+	ErrSignalingSlow = errors.New("peer signaling queue is full")
+	ErrRoomLimit     = errors.New("server room limit reached")
+	ErrRoomNotFound  = errors.New("room not found")
 )
 
 type Peer struct {
 	ID       string
 	Username string
 	Conn     *websocket.Conn
-	Send     chan protocol.SignalingMessage
+	Send     chan outboundMessage
 	Ctx      context.Context
 	Cancel   context.CancelFunc
 }
 
-type Room struct {
-	ID        string
-	Peers     map[string]*Peer
-	mu        sync.RWMutex
-	CreatedAt time.Time
-	MaxPeers  int
+type outboundMessage struct {
+	message protocol.SignalingMessage
+	result  chan error
 }
 
-type RoomManager struct {
-	rooms map[string]*Room
-	mu    sync.RWMutex
-}
-
-func NewRoomManager() *RoomManager {
-	return &RoomManager{
-		rooms: make(map[string]*Room),
+func (p *Peer) enqueue(message protocol.SignalingMessage) error {
+	select {
+	case p.Send <- outboundMessage{message: message}:
+		return nil
+	default:
+		p.Cancel()
+		return ErrSignalingSlow
 	}
 }
 
-// GetOrCreateRoom returns an existing room or creates a new one
-func (rm *RoomManager) GetOrCreateRoom(id string, maxPeers int) *Room {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	if id == "new" || id == "" {
-		id = uuid.New().String()[:8]
-	}
-
-	room, exists := rm.rooms[id]
-	if !exists {
-		room = &Room{
-			ID:        id,
-			Peers:     make(map[string]*Peer),
-			CreatedAt: time.Now(),
-			MaxPeers:  maxPeers,
-		}
-		rm.rooms[id] = room
-	}
-
-	return room
-}
-
-// RemoveRoom deletes a room if it exists
-func (rm *RoomManager) RemoveRoom(id string) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	delete(rm.rooms, id)
-}
-
-// AddPeer adds a peer to the room. Returns an error if room is full.
-func (r *Room) AddPeer(peer *Peer) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if len(r.Peers) >= r.MaxPeers {
-		return fmt.Errorf("room is full (max %d peers)", r.MaxPeers)
-	}
-
-	r.Peers[peer.ID] = peer
-	return nil
-}
-
-// RemovePeer removes a peer from the room. Returns the remaining number of peers.
-func (r *Room) RemovePeer(peerID string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	delete(r.Peers, peerID)
-	return len(r.Peers)
-}
-
-// Broadcast sends a message to all peers in the room EXCEPT the specified excludePeerID.
-func (r *Room) Broadcast(msg protocol.SignalingMessage, excludePeerID string) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for id, peer := range r.Peers {
-		if id != excludePeerID {
-			select {
-			case peer.Send <- msg:
-			default:
-				// If the send channel is full, drop the message or handle it
-				// For signaling, channel shouldn't be full unless client is dead
-			}
-		}
-	}
-}
-
-// RouteMessage sends a message to a specific peer in the room.
-func (r *Room) RouteMessage(targetPeerID string, msg protocol.SignalingMessage) error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	target, exists := r.Peers[targetPeerID]
-	if !exists {
-		return fmt.Errorf("peer %s not found in room", targetPeerID)
+func (p *Peer) enqueueAndWait(ctx context.Context, message protocol.SignalingMessage) error {
+	result := make(chan error, 1)
+	select {
+	case p.Send <- outboundMessage{message: message, result: result}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.Ctx.Done():
+		return p.Ctx.Err()
+	default:
+		p.Cancel()
+		return ErrSignalingSlow
 	}
 
 	select {
-	case target.Send <- msg:
-		return nil
-	default:
-		return fmt.Errorf("peer %s send channel full", targetPeerID)
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.Ctx.Done():
+		return p.Ctx.Err()
 	}
 }
 
-// GetPeers returns a snapshot of the current peers
-func (r *Room) GetPeers() []protocol.SignalingMessage {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+type Room struct {
+	ID        string
+	CreatedAt time.Time
+	MaxPeers  int
+	peers     map[string]*Peer
+}
 
-	peers := make([]protocol.SignalingMessage, 0, len(r.Peers))
-	for _, p := range r.Peers {
-		peers = append(peers, protocol.SignalingMessage{
-			Type:     protocol.MsgPeerJoined,
-			PeerID:   p.ID,
-			Username: p.Username,
+type RoomManager struct {
+	rooms    map[string]*Room
+	maxRooms int
+	mu       sync.RWMutex
+}
+
+func NewRoomManager(maxRooms int) *RoomManager {
+	return &RoomManager{
+		rooms:    map[string]*Room{},
+		maxRooms: maxRooms,
+	}
+}
+
+func (manager *RoomManager) Join(requestedID string, maxPeers int, peer *Peer) (*Room, []protocol.PeerInfo, error) {
+	var existing []protocol.PeerInfo
+	room, err := manager.Admit(requestedID, maxPeers, peer, func(_ string, peers []protocol.PeerInfo) error {
+		existing = peers
+		return nil
+	})
+	return room, existing, err
+}
+
+// Admit commits a peer only after its admission response has been prepared and
+// queued. The callback runs under the manager lock and must not block on I/O.
+func (manager *RoomManager) Admit(
+	requestedID string,
+	maxPeers int,
+	peer *Peer,
+	accept func(roomID string, existing []protocol.PeerInfo) error,
+) (*Room, error) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	room, exists := manager.rooms[requestedID]
+	if requestedID == "new" {
+		if len(manager.rooms) >= manager.maxRooms {
+			return nil, ErrRoomLimit
+		}
+		roomID := uuid.NewString()
+		room = &Room{
+			ID:        roomID,
+			CreatedAt: time.Now(),
+			MaxPeers:  maxPeers,
+			peers:     map[string]*Peer{},
+		}
+		manager.rooms[roomID] = room
+	} else if !exists {
+		return nil, ErrRoomNotFound
+	}
+	if len(room.peers) >= room.MaxPeers {
+		return nil, fmt.Errorf("%w (maximum %d peers)", ErrRoomFull, room.MaxPeers)
+	}
+
+	existingPeers := peerInfoSnapshot(room.peers, "")
+	if accept != nil {
+		if err := accept(room.ID, existingPeers); err != nil {
+			if len(room.peers) == 0 {
+				delete(manager.rooms, room.ID)
+			}
+			return nil, err
+		}
+	}
+	room.peers[peer.ID] = peer
+	return room, nil
+}
+
+// Leave atomically removes a peer and deletes the same room instance when it
+// becomes empty. A stale handler cannot delete a newly created replacement.
+func (manager *RoomManager) Leave(room *Room, peerID string) []*Peer {
+	if room == nil {
+		return []*Peer{}
+	}
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	current, exists := manager.rooms[room.ID]
+	if !exists || current != room {
+		return []*Peer{}
+	}
+	delete(current.peers, peerID)
+	remaining := peerSnapshot(current.peers, "")
+	if len(current.peers) == 0 {
+		delete(manager.rooms, current.ID)
+	}
+	return remaining
+}
+
+func (manager *RoomManager) Broadcast(
+	room *Room,
+	message protocol.SignalingMessage,
+	excludePeerID string,
+) int {
+	peers := manager.roomPeers(room, excludePeerID)
+	disconnected := 0
+	for _, peer := range peers {
+		if err := peer.enqueue(message); err != nil {
+			disconnected++
+		}
+	}
+	return disconnected
+}
+
+func (manager *RoomManager) Route(room *Room, targetPeerID string, message protocol.SignalingMessage) error {
+	manager.mu.RLock()
+	current, exists := manager.rooms[room.ID]
+	if !exists || current != room {
+		manager.mu.RUnlock()
+		return ErrPeerNotFound
+	}
+	target, exists := current.peers[targetPeerID]
+	manager.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("%w: %s", ErrPeerNotFound, targetPeerID)
+	}
+	return target.enqueue(message)
+}
+
+func (manager *RoomManager) Peers(room *Room) []protocol.PeerInfo {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	current, exists := manager.rooms[room.ID]
+	if !exists || current != room {
+		return []protocol.PeerInfo{}
+	}
+	return peerInfoSnapshot(current.peers, "")
+}
+
+func (manager *RoomManager) RoomCount() int {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return len(manager.rooms)
+}
+
+func (manager *RoomManager) roomPeers(room *Room, excludePeerID string) []*Peer {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	current, exists := manager.rooms[room.ID]
+	if !exists || current != room {
+		return []*Peer{}
+	}
+	return peerSnapshot(current.peers, excludePeerID)
+}
+
+func peerSnapshot(peers map[string]*Peer, excludePeerID string) []*Peer {
+	result := make([]*Peer, 0, len(peers))
+	for peerID, peer := range peers {
+		if peerID != excludePeerID {
+			result = append(result, peer)
+		}
+	}
+	return result
+}
+
+func peerInfoSnapshot(peers map[string]*Peer, excludePeerID string) []protocol.PeerInfo {
+	result := make([]protocol.PeerInfo, 0, len(peers))
+	for peerID, peer := range peers {
+		if peerID == excludePeerID {
+			continue
+		}
+		result = append(result, protocol.PeerInfo{
+			PeerID:   peer.ID,
+			Username: peer.Username,
 		})
 	}
-	return peers
+	return result
 }

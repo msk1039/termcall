@@ -1,314 +1,434 @@
 package ascii
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 )
 
-// Wire format
-//
-//	Keyframe: "K <w> <h> <mode>\n" + rows of ';'-separated cells
-//	           ("<fg>,<bg>,<char>"), rows separated by '\n'.
-//	Delta:     "D <w> <h> <count>\n" + one line per changed cell
-//	           ("<row> <col> <fg> <bg> <char>").
-//
-// Any other payload is treated as a legacy plain-ANSI string (returned as-is)
-// so new clients interoperate with old ones.
+const (
+	MaxFrameWidth        = 100
+	MaxFrameHeight       = 30
+	MaxFrameCells        = MaxFrameWidth * MaxFrameHeight
+	MaxEncodedFrameBytes = 128 * 1024
+)
 
-// DeltaEncoder tracks the previous frame's cell grid and emits either a
-// keyframe (full grid) or a delta (only changed cells). A keyframe is forced
-// on the first frame, on a dimension change, or every keyframeEvery frames.
+var (
+	ErrFrameTooLarge     = errors.New("frame exceeds protocol limits")
+	ErrMalformedFrame    = errors.New("malformed frame")
+	ErrUnsupportedFrame  = errors.New("unsupported frame type")
+	ErrMissingKeyframe   = errors.New("delta has no matching keyframe")
+	ErrInvalidFrameValue = errors.New("frame contains an invalid value")
+)
+
+// DeltaEncoder tracks the previous frame and emits either a complete keyframe
+// or the changed cells. Encoded frames are data, never terminal escape text.
 type DeltaEncoder struct {
 	prev          [][]Cell
-	w, h          int
+	w             int
+	h             int
 	mode          RenderMode
 	frameCount    int
 	keyframeEvery int
 }
 
 func NewDeltaEncoder(mode RenderMode, keyframeInterval int) *DeltaEncoder {
-	return &DeltaEncoder{mode: mode, keyframeEvery: keyframeInterval}
+	if keyframeInterval < 1 {
+		keyframeInterval = 30
+	}
+	return &DeltaEncoder{
+		mode:          mode,
+		keyframeEvery: keyframeInterval,
+	}
 }
 
-// Reset clears the baseline so the next frame is a keyframe.
 func (e *DeltaEncoder) Reset() {
 	e.prev = nil
-	e.w, e.h = 0, 0
+	e.w = 0
+	e.h = 0
 	e.frameCount = 0
 }
 
-// Encode returns the wire string for cells: a keyframe ("K ...") or delta
-// ("D ..."). If a delta would change more than half the grid, a keyframe is
-// sent instead (smaller and lets the receiver resync).
 func (e *DeltaEncoder) Encode(cells [][]Cell) string {
-	e.frameCount++
-	h := len(cells)
-	w := 0
-	if h > 0 {
-		w = len(cells[0])
+	w, h, err := validateGrid(cells, e.mode)
+	if err != nil {
+		return ""
 	}
 
-	if e.prev == nil || e.w != w || e.h != h || e.frameCount >= e.keyframeEvery {
+	e.frameCount++
+	requiresKeyframe := e.prev == nil || e.w != w || e.h != h || e.frameCount >= e.keyframeEvery
+	if requiresKeyframe {
 		e.frameCount = 0
 		e.prev = deepCopyCells(cells)
-		e.w, e.h = w, h
+		e.w = w
+		e.h = h
 		return e.encodeKeyframe(cells)
 	}
 
-	enc := e.encodeDelta(cells)
-	if enc == "" {
-		// Delta too large — send a keyframe instead.
+	encoded := e.encodeDelta(cells)
+	if encoded == "" {
 		e.frameCount = 0
 		e.prev = deepCopyCells(cells)
 		return e.encodeKeyframe(cells)
 	}
 	e.prev = deepCopyCells(cells)
-	return enc
+	return encoded
 }
 
 func (e *DeltaEncoder) encodeKeyframe(cells [][]Cell) string {
 	h := len(cells)
-	w := 0
-	if h > 0 {
-		w = len(cells[0])
-	}
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "K %d %d %d\n", w, h, int(e.mode))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	w := len(cells[0])
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "K %d %d %d\n", w, h, int(e.mode))
+	for _, row := range cells {
+		for x, cell := range row {
 			if x > 0 {
-				sb.WriteByte(';')
+				builder.WriteByte(';')
 			}
-			c := cells[y][x]
-			fmt.Fprintf(&sb, "%d,%d,%d", c.Fg, c.Bg, int(c.Char))
+			fmt.Fprintf(&builder, "%d,%d,%d", cell.Fg, cell.Bg, int(cell.Char))
 		}
-		sb.WriteByte('\n')
+		builder.WriteByte('\n')
 	}
-	return sb.String()
+	return builder.String()
 }
 
-// encodeDelta returns the delta string, or "" if more than half the grid
-// changed (caller should send a keyframe instead).
+// encodeDelta returns an empty string when a keyframe is more appropriate.
 func (e *DeltaEncoder) encodeDelta(cells [][]Cell) string {
 	h := len(cells)
-	w := 0
-	if h > 0 {
-		w = len(cells[0])
-	}
+	w := len(cells[0])
 	total := w * h
-	if total == 0 {
-		return ""
-	}
 
-	var sb strings.Builder
+	var changes strings.Builder
 	count := 0
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			c := cells[y][x]
-			p := e.prev[y][x]
-			if c != p {
-				fmt.Fprintf(&sb, "%d %d %d %d %d\n", y, x, c.Fg, c.Bg, int(c.Char))
-				count++
+	for y, row := range cells {
+		for x, cell := range row {
+			if cell == e.prev[y][x] {
+				continue
 			}
+			fmt.Fprintf(&changes, "%d %d %d %d %d\n", y, x, cell.Fg, cell.Bg, int(cell.Char))
+			count++
 		}
 	}
 	if count > total/2 {
 		return ""
 	}
-	return fmt.Sprintf("D %d %d %d\n%s", w, h, count, sb.String())
+	return fmt.Sprintf("D %d %d %d\n%s", w, h, count, changes.String())
 }
 
-// DeltaDecoder receives keyframes and deltas, maintains a cell grid, and
-// produces full ANSI strings for display. Plain (non-K/D) payloads are
-// returned unchanged for backward compatibility.
 type DeltaDecoder struct {
 	grid [][]Cell
-	w, h int
+	w    int
+	h    int
 	mode RenderMode
 	has  bool
 }
 
 func NewDeltaDecoder() *DeltaDecoder {
-	return &DeltaDecoder{}
+	return &DeltaDecoder{
+		grid: [][]Cell{},
+	}
 }
 
-// Decode parses a wire string (keyframe, delta, or legacy plain ANSI) and
-// returns the full ANSI display string.
-func (d *DeltaDecoder) Decode(data string) string {
-	if data == "" {
-		return ""
+func (d *DeltaDecoder) Decode(data string) (string, error) {
+	cells, mode, err := d.DecodeCells(data)
+	if err != nil {
+		return "", err
 	}
+	return SerialiseMode(cells, mode), nil
+}
+
+func (d *DeltaDecoder) DecodeCells(data string) ([][]Cell, RenderMode, error) {
+	if len(data) == 0 {
+		return nil, 0, fmt.Errorf("%w: empty payload", ErrMalformedFrame)
+	}
+	if len(data) > MaxEncodedFrameBytes {
+		return nil, 0, ErrFrameTooLarge
+	}
+
+	var err error
 	switch data[0] {
 	case 'K':
-		return d.decodeKeyframe(data)
+		err = d.decodeKeyframe(data)
 	case 'D':
-		return d.decodeDelta(data)
+		err = d.decodeDelta(data)
 	default:
-		return data // legacy plain ANSI string
+		err = ErrUnsupportedFrame
 	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return deepCopyCells(d.grid), d.mode, nil
 }
 
-// DecodeCells parses a wire frame and returns the raw cell grid + its mode.
-// For legacy plain-ANSI payloads, returns nil (caller should display as-is).
-func (d *DeltaDecoder) DecodeCells(data string) ([][]Cell, RenderMode, bool) {
-	if data == "" {
-		return nil, 0, false
+func (d *DeltaDecoder) decodeKeyframe(data string) error {
+	header, body, err := splitFrame(data)
+	if err != nil {
+		return err
 	}
-	switch data[0] {
-	case 'K':
-		if d.decodeKeyframeInto(data) {
-			return deepCopyCells(d.grid), d.mode, d.has
-		}
-	case 'D':
-		if d.decodeDeltaInto(data) {
-			return deepCopyCells(d.grid), d.mode, d.has
-		}
-	}
-	return nil, 0, false
-}
-
-func (d *DeltaDecoder) decodeKeyframeInto(data string) bool {
-	nl := strings.IndexByte(data, '\n')
-	if nl < 0 {
-		return false
-	}
-	parts := strings.Fields(data[:nl])
-	if len(parts) < 4 {
-		return false
-	}
-	w, err1 := strconv.Atoi(parts[1])
-	h, err2 := strconv.Atoi(parts[2])
-	mode, err3 := strconv.Atoi(parts[3])
-	if err1 != nil || err2 != nil || err3 != nil || w <= 0 || h <= 0 {
-		return false
+	fields := strings.Fields(header)
+	if len(fields) != 4 || fields[0] != "K" {
+		return ErrMalformedFrame
 	}
 
-	d.w, d.h, d.mode, d.has = w, h, RenderMode(mode), true
+	w, err := parseInt(fields[1])
+	if err != nil {
+		return err
+	}
+	h, err := parseInt(fields[2])
+	if err != nil {
+		return err
+	}
+	modeValue, err := parseInt(fields[3])
+	if err != nil {
+		return err
+	}
+	mode := RenderMode(modeValue)
+	if err := validateDimensions(w, h); err != nil {
+		return err
+	}
+	if !validMode(mode) {
+		return fmt.Errorf("%w: render mode %d", ErrInvalidFrameValue, modeValue)
+	}
+
+	lines := payloadLines(body)
+	if len(lines) != h {
+		return fmt.Errorf("%w: got %d rows, want %d", ErrMalformedFrame, len(lines), h)
+	}
+
 	grid := make([][]Cell, h)
-	for y := range grid {
-		grid[y] = make([]Cell, w)
-	}
-	r := bufio.NewReader(strings.NewReader(data[nl+1:]))
-	for y := 0; y < h; y++ {
-		line, err := r.ReadString('\n')
-		if err != nil && line == "" {
-			break
+	for y, line := range lines {
+		encodedCells := strings.Split(line, ";")
+		if len(encodedCells) != w {
+			return fmt.Errorf("%w: row %d has %d cells, want %d", ErrMalformedFrame, y, len(encodedCells), w)
 		}
-		line = strings.TrimRight(line, "\n")
-		cells := strings.Split(line, ";")
-		for x := 0; x < w && x < len(cells); x++ {
-			grid[y][x] = parseCell(cells[x])
+
+		row := make([]Cell, w)
+		for x, encodedCell := range encodedCells {
+			cell, err := parseCell(encodedCell, mode)
+			if err != nil {
+				return fmt.Errorf("row %d cell %d: %w", y, x, err)
+			}
+			row[x] = cell
 		}
+		grid[y] = row
 	}
+
 	d.grid = grid
-	return true
+	d.w = w
+	d.h = h
+	d.mode = mode
+	d.has = true
+	return nil
 }
 
-func (d *DeltaDecoder) decodeKeyframe(data string) string {
-	if !d.decodeKeyframeInto(data) {
-		return data
+func (d *DeltaDecoder) decodeDelta(data string) error {
+	header, body, err := splitFrame(data)
+	if err != nil {
+		return err
 	}
-	return d.serialise()
-}
+	fields := strings.Fields(header)
+	if len(fields) != 4 || fields[0] != "D" {
+		return ErrMalformedFrame
+	}
 
-func (d *DeltaDecoder) decodeDeltaInto(data string) bool {
-	nl := strings.IndexByte(data, '\n')
-	if nl < 0 {
-		return false
+	w, err := parseInt(fields[1])
+	if err != nil {
+		return err
 	}
-	parts := strings.Fields(data[:nl])
-	if len(parts) < 4 {
-		return false
+	h, err := parseInt(fields[2])
+	if err != nil {
+		return err
 	}
-	w, err1 := strconv.Atoi(parts[1])
-	h, err2 := strconv.Atoi(parts[2])
-	count, err3 := strconv.Atoi(parts[3])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return false
+	count, err := parseInt(fields[3])
+	if err != nil {
+		return err
 	}
-	if !d.has || d.w != w || d.h != h || d.grid == nil {
-		// Delta without a matching keyframe — cannot apply safely.
-		return false
+	if err := validateDimensions(w, h); err != nil {
+		return err
 	}
-	r := bufio.NewReader(strings.NewReader(data[nl+1:]))
-	for i := 0; i < count; i++ {
-		line, err := r.ReadString('\n')
-		if err != nil && line == "" {
-			break
+	if count < 0 || count > w*h {
+		return fmt.Errorf("%w: change count %d", ErrInvalidFrameValue, count)
+	}
+	if !d.has || d.w != w || d.h != h || len(d.grid) == 0 {
+		return ErrMissingKeyframe
+	}
+
+	lines := payloadLines(body)
+	if count == 0 && len(lines) == 1 && lines[0] == "" {
+		lines = []string{}
+	}
+	if len(lines) != count {
+		return fmt.Errorf("%w: got %d changes, want %d", ErrMalformedFrame, len(lines), count)
+	}
+
+	grid := deepCopyCells(d.grid)
+	seen := make(map[int]struct{}, count)
+	for i, line := range lines {
+		change := strings.Fields(line)
+		if len(change) != 5 {
+			return fmt.Errorf("%w: change %d has %d fields", ErrMalformedFrame, i, len(change))
 		}
-		f := strings.Fields(strings.TrimRight(line, "\n"))
-		if len(f) < 5 {
-			continue
+
+		row, err := parseInt(change[0])
+		if err != nil {
+			return err
 		}
-		row, e1 := strconv.Atoi(f[0])
-		col, e2 := strconv.Atoi(f[1])
-		fg, e3 := strconv.Atoi(f[2])
-		bg, e4 := strconv.Atoi(f[3])
-		ch, e5 := strconv.Atoi(f[4])
-		if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil {
-			continue
+		col, err := parseInt(change[1])
+		if err != nil {
+			return err
 		}
 		if row < 0 || row >= h || col < 0 || col >= w {
-			continue
+			return fmt.Errorf("%w: cell position %d,%d", ErrInvalidFrameValue, row, col)
 		}
-		d.grid[row][col] = Cell{Char: byte(ch), Fg: fg, Bg: bg}
+		index := row*w + col
+		if _, exists := seen[index]; exists {
+			return fmt.Errorf("%w: duplicate cell position %d,%d", ErrMalformedFrame, row, col)
+		}
+		seen[index] = struct{}{}
+
+		cell, err := parseCellFields(change[2], change[3], change[4], d.mode)
+		if err != nil {
+			return fmt.Errorf("change %d: %w", i, err)
+		}
+		grid[row][col] = cell
 	}
-	return true
+
+	d.grid = grid
+	return nil
 }
 
-func (d *DeltaDecoder) decodeDelta(data string) string {
-	nl := strings.IndexByte(data, '\n')
-	if nl < 0 {
-		return data
+func splitFrame(data string) (string, string, error) {
+	newline := strings.IndexByte(data, '\n')
+	if newline < 0 {
+		return "", "", ErrMalformedFrame
 	}
-	parts := strings.Fields(data[:nl])
-	if len(parts) < 4 {
-		return data
-	}
-	w, err1 := strconv.Atoi(parts[1])
-	h, err2 := strconv.Atoi(parts[2])
-	_, err3 := strconv.Atoi(parts[3])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return data
-	}
-	if !d.has || d.w != w || d.h != h || d.grid == nil {
-		return ""
-	}
-	if d.decodeDeltaInto(data) {
-		return d.serialise()
-	}
-	return ""
+	return data[:newline], data[newline+1:], nil
 }
 
-func (d *DeltaDecoder) serialise() string {
-	if d.grid == nil {
-		return ""
-	}
-	switch d.mode {
-	case ModeASCII:
-		return serialiseASCII(d.grid)
-	case ModeColor256:
-		return serialiseColor256(d.grid)
-	case ModeHalfBlock:
-		return serialiseHalfBlock(d.grid)
-	}
-	return ""
+func payloadLines(body string) []string {
+	body = strings.TrimSuffix(body, "\n")
+	return strings.Split(body, "\n")
 }
 
-// parseCell parses "<fg>,<bg>,<char>" into a Cell. Invalid input yields a
-// default cell with Fg/Bg = -1.
-func parseCell(s string) Cell {
-	parts := strings.Split(s, ",")
-	if len(parts) < 3 {
-		return Cell{Fg: -1, Bg: -1}
+func parseCell(encoded string, mode RenderMode) (Cell, error) {
+	fields := strings.Split(encoded, ",")
+	if len(fields) != 3 {
+		return Cell{}, ErrMalformedFrame
 	}
-	fg, e1 := strconv.Atoi(parts[0])
-	bg, e2 := strconv.Atoi(parts[1])
-	ch, e3 := strconv.Atoi(parts[2])
-	if e1 != nil || e2 != nil || e3 != nil {
-		return Cell{Fg: -1, Bg: -1}
+	return parseCellFields(fields[0], fields[1], fields[2], mode)
+}
+
+func parseCellFields(fgValue, bgValue, charValue string, mode RenderMode) (Cell, error) {
+	fg, err := parseInt(fgValue)
+	if err != nil {
+		return Cell{}, err
 	}
-	return Cell{Char: byte(ch), Fg: fg, Bg: bg}
+	bg, err := parseInt(bgValue)
+	if err != nil {
+		return Cell{}, err
+	}
+	charInt, err := parseInt(charValue)
+	if err != nil {
+		return Cell{}, err
+	}
+	if fg < -1 || fg > 255 || bg < -1 || bg > 255 {
+		return Cell{}, ErrInvalidFrameValue
+	}
+	if charInt < 0 || charInt > 126 {
+		return Cell{}, ErrInvalidFrameValue
+	}
+	if charInt != 0 && charInt < 32 {
+		return Cell{}, ErrInvalidFrameValue
+	}
+	if charInt == 0 && mode != ModeHalfBlock {
+		return Cell{}, ErrInvalidFrameValue
+	}
+	return Cell{
+		Char: byte(charInt),
+		Fg:   fg,
+		Bg:   bg,
+	}, nil
+}
+
+func parseInt(value string) (int, error) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, ErrMalformedFrame
+	}
+	return parsed, nil
+}
+
+func validateGrid(cells [][]Cell, mode RenderMode) (int, int, error) {
+	if !validMode(mode) {
+		return 0, 0, ErrInvalidFrameValue
+	}
+	h := len(cells)
+	if h == 0 {
+		return 0, 0, ErrInvalidFrameValue
+	}
+	w := len(cells[0])
+	if err := validateDimensions(w, h); err != nil {
+		return 0, 0, err
+	}
+	for _, row := range cells {
+		if len(row) != w {
+			return 0, 0, ErrMalformedFrame
+		}
+		for _, cell := range row {
+			if _, err := parseCellFields(
+				strconv.Itoa(cell.Fg),
+				strconv.Itoa(cell.Bg),
+				strconv.Itoa(int(cell.Char)),
+				mode,
+			); err != nil {
+				return 0, 0, err
+			}
+		}
+	}
+	return w, h, nil
+}
+
+func validateDimensions(w, h int) error {
+	isPositive := w > 0 && h > 0
+	isWithinBounds := w <= MaxFrameWidth && h <= MaxFrameHeight
+	if !isPositive || !isWithinBounds || w*h > MaxFrameCells {
+		return ErrFrameTooLarge
+	}
+	return nil
+}
+
+func validMode(mode RenderMode) bool {
+	return mode >= ModeASCII && mode <= ModeHalfBlock
+}
+
+// StatusFrame returns a small, safe keyframe used for local media state such
+// as a disabled camera. Only printable ASCII is emitted.
+func StatusFrame(message string) string {
+	printable := make([]byte, 0, len(message))
+	for i := 0; i < len(message) && len(printable) < 40; i++ {
+		if message[i] >= 32 && message[i] <= 126 {
+			printable = append(printable, message[i])
+		}
+	}
+	if len(printable) == 0 {
+		printable = []byte("Unavailable")
+	}
+	width := len(printable) + 4
+	if width < 16 {
+		width = 16
+	}
+	grid := make([][]Cell, 3)
+	for y := range grid {
+		grid[y] = make([]Cell, width)
+		for x := range grid[y] {
+			grid[y][x] = Cell{Char: ' ', Fg: -1, Bg: -1}
+		}
+	}
+	start := (width - len(printable)) / 2
+	for index, char := range printable {
+		grid[1][start+index].Char = char
+	}
+	return NewDeltaEncoder(ModeASCII, 1).Encode(grid)
 }

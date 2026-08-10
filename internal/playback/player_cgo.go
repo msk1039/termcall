@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	sampleRate = 48000
-	channels   = 1 // WebRTC Opus defaults to mono/48kHz
+	sampleRate      = 48000
+	channels        = 1 // WebRTC Opus defaults to mono/48kHz
+	pcmBufferFrames = 8
 )
 
 type Player struct {
@@ -43,7 +44,7 @@ func NewPlayer() (*Player, error) {
 	p := &Player{
 		dec:     dec,
 		ctx:     ctx,
-		pcmChan: make(chan []int16, 500), // Buffer ~500 frames to prevent stuttering
+		pcmChan: make(chan []int16, pcmBufferFrames),
 	}
 
 	deviceConfig := malgo.DefaultDeviceConfig(malgo.Playback)
@@ -103,7 +104,15 @@ func (p *Player) WriteOpus(data []byte) error {
 	select {
 	case p.pcmChan <- pcm[:n]:
 	default:
-		// Drop packet if the buffer is full to prevent falling behind live audio
+		// Prefer current audio: discard the oldest queued frame before retrying.
+		select {
+		case <-p.pcmChan:
+		default:
+		}
+		select {
+		case p.pcmChan <- pcm[:n]:
+		default:
+		}
 	}
 	return nil
 }
@@ -142,7 +151,9 @@ func (p *Player) onAudioRequest(pOutputSample, pInputSamples []byte, framecount 
 		for i := 0; i < take; i++ {
 			sample := p.leftover[i]
 			byteIdx := (outIdx + i) * 2
+			// #nosec G115 -- FormatS16 requires the low and high bytes of the signed PCM sample.
 			pOutputSample[byteIdx] = byte(sample)
+			// #nosec G115 -- the arithmetic shift intentionally preserves the signed sample representation.
 			pOutputSample[byteIdx+1] = byte(sample >> 8)
 		}
 

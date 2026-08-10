@@ -3,6 +3,9 @@
 /plans
 /.agents
 
+# Operating-system metadata
+.DS_Store
+
 # Binaries
 *.exe
 *.exe~*
@@ -26,7 +29,7 @@ diagtest
 # Agent files
 skills-lock.json
 
-# Markdown files
-*.md
-!README.md
+# Community and release documentation must remain tracked.
+# Do not add a blanket *.md ignore rule here.
+
 /reference

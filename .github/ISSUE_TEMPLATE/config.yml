@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/msk1039/termcall/security/advisories/new
+    about: Report vulnerabilities privately. Do not create a public issue.
+  - name: Support policy
+    url: https://github.com/msk1039/termcall/blob/main/SUPPORT.md
+    about: Read support scope and what information to include.

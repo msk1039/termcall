@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/pion/webrtc/v4"
 )
 
 type screen int
@@ -34,6 +35,22 @@ type PeerFrameMsg struct {
 
 type LocalFrameMsg struct {
 	RawImage image.Image
+	Source   <-chan image.Image
+	Closed   bool
+}
+
+type CameraStartedMsg struct {
+	Frames <-chan image.Image
+	Err    error
+}
+
+type MicrophoneStartedMsg struct {
+	Track webrtc.TrackLocal
+	Err   error
+}
+
+type CallErrorMsg struct {
+	Err error
 }
 
 type StatsTickMsg struct{}
@@ -162,7 +179,15 @@ func (m *AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case PeerFrameMsg, LocalFrameMsg, PeerJoinMsg, PeerLeaveMsg, StatsTickMsg, VolumeTickMsg:
+	case PeerFrameMsg,
+		LocalFrameMsg,
+		CameraStartedMsg,
+		MicrophoneStartedMsg,
+		CallErrorMsg,
+		PeerJoinMsg,
+		PeerLeaveMsg,
+		StatsTickMsg,
+		VolumeTickMsg:
 		if m.currentScreen == screenCall && m.callModel != nil {
 			cm, cmd := m.callModel.Update(msg)
 			m.callModel = cm.(*CallModel)

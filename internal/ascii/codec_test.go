@@ -1,6 +1,9 @@
 package ascii
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func mkHalfBlockGrid(w, h, base int) [][]Cell {
 	cells := make([][]Cell, h)
@@ -41,7 +44,7 @@ func TestDeltaRoundTrip(t *testing.T) {
 		t.Fatalf("first frame should be a keyframe, got %q", out1)
 	}
 	want1 := serialiseHalfBlock(g1)
-	if got := dec.Decode(out1); got != want1 {
+	if got, err := dec.Decode(out1); err != nil || got != want1 {
 		t.Errorf("keyframe round-trip mismatch:\ngot:  %q\nwant: %q", got, want1)
 	}
 
@@ -50,7 +53,7 @@ func TestDeltaRoundTrip(t *testing.T) {
 	if out2[0] != 'D' {
 		t.Fatalf("unchanged frame should be a delta, got %q", out2)
 	}
-	if got := dec.Decode(out2); got != want1 {
+	if got, err := dec.Decode(out2); err != nil || got != want1 {
 		t.Errorf("empty delta round-trip mismatch:\ngot:  %q\nwant: %q", got, want1)
 	}
 
@@ -62,14 +65,14 @@ func TestDeltaRoundTrip(t *testing.T) {
 		t.Fatalf("one-cell change should be a delta, got %q", out3)
 	}
 	want3 := serialiseHalfBlock(g2)
-	if got := dec.Decode(out3); got != want3 {
+	if got, err := dec.Decode(out3); err != nil || got != want3 {
 		t.Errorf("delta round-trip mismatch:\ngot:  %q\nwant: %q", got, want3)
 	}
 
-	// Legacy plain-ANSI string → returned unchanged.
+	// Raw ANSI is never accepted from a remote peer.
 	legacy := "\x1b[48;5;16m▄\x1b[0m"
-	if got := dec.Decode(legacy); got != legacy {
-		t.Errorf("legacy passthrough mismatch: got %q", got)
+	if _, err := dec.Decode(legacy); !errors.Is(err, ErrUnsupportedFrame) {
+		t.Errorf("legacy ANSI should be rejected, got %v", err)
 	}
 }
 
@@ -78,7 +81,9 @@ func TestDeltaKeyframeFallback(t *testing.T) {
 	dec := NewDeltaDecoder()
 
 	g1 := mkHalfBlockGrid(4, 2, 60)
-	dec.Decode(enc.Encode(g1)) // seed keyframe
+	if _, err := dec.Decode(enc.Encode(g1)); err != nil {
+		t.Fatalf("seed keyframe: %v", err)
+	}
 
 	// Change >50% of cells → encoder must fall back to a keyframe.
 	g2 := deepCopyCells(g1)
@@ -91,7 +96,7 @@ func TestDeltaKeyframeFallback(t *testing.T) {
 	if out[0] != 'K' {
 		t.Fatalf("large change should fall back to keyframe, got %q", out)
 	}
-	if got := dec.Decode(out); got != serialiseHalfBlock(g2) {
+	if got, err := dec.Decode(out); err != nil || got != serialiseHalfBlock(g2) {
 		t.Errorf("fallback keyframe round-trip mismatch")
 	}
 }

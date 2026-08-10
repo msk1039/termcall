@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: 1.26.5
+
+jobs:
+  test:
+    name: Tests and static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Verify downloaded modules
+        run: go mod verify
+
+      - name: Verify module metadata is tidy
+        run: go mod tidy -diff
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [[ -n "$unformatted" ]]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Race tests
+        run: go test -race ./...
+
+      - name: Enforce core-package coverage
+        shell: bash
+        run: |
+          go test -cover ./internal/ascii ./internal/config ./internal/protocol ./internal/signaling ./internal/turn | tee coverage-summary.txt
+          scripts/check_coverage.sh 70 < coverage-summary.txt
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Scan reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Run gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.28.0 -quiet ./...
+
+      - name: Scan repository history for secrets
+        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 detect --source . --redact --no-banner
+
+  portable-builds:
+    name: Portable server and receive-only clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Build Linux server
+        run: env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/termcall-server ./cmd/termcall-server
+
+      - name: Build Linux receive-only client
+        run: env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/termcall-linux ./cmd/termcall
+
+      - name: Build Windows receive-only client
+        run: env CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o /tmp/termcall-windows.exe ./cmd/termcall
+
+  macos-native:
+    name: macOS native-media build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Test native packages
+        run: go test ./...
+
+      - name: Build native client
+        run: ./scripts/build_macos.sh /tmp/termcall
+
+  fuzz-smoke:
+    name: Fuzz smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Fuzz bounded frame decoding
+        run: go test ./internal/ascii -run '^$' -fuzz '^FuzzDeltaDecoder$' -fuzztime 15s
+
+      - name: Fuzz signaling validation
+        run: go test ./internal/protocol -run '^$' -fuzz '^FuzzValidateClientMessage$' -fuzztime 15s
+
+  container:
+    name: Reproducible server container
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build pinned container
+        run: docker build --tag termcall-server:ci .

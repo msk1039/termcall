@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"sync"
 	"sync/atomic"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,141 +19,135 @@ import (
 )
 
 func main() {
-	username := flag.String("username", "", "Username for the call (with -room, skips the join form)")
-	roomID := flag.String("room", "", "Room ID to join (with -username, skips the join form)")
-	serverURL := flag.String("server", "", "Signaling server URL (defaults to "+tui.DefaultServerURL+")")
-	flag.Usage = func() {
-		out := flag.CommandLine.Output()
-		fmt.Fprintln(out, "Usage:")
-		fmt.Fprintln(out, "  termcall                                         Start the TUI join form.")
-		fmt.Fprintln(out, "  termcall -username <name> -room <room> [-server <url>]")
-		fmt.Fprintln(out, "                                                   Skip the form and join directly.")
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, "With flags, both -username and -room are required; -server is optional and")
-		fmt.Fprintln(out, "defaults to "+tui.DefaultServerURL+".")
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, "Flags:")
-		flag.PrintDefaults()
-	}
+	username := flag.String("username", "", "username for the call (with -room, skips the join form)")
+	roomID := flag.String("room", "", "room ID to join (with -username, skips the join form)")
+	serverURL := flag.String("server", "", "signaling server URL (defaults to "+tui.DefaultServerURL+")")
+	allowInsecureWS := flag.Bool("allow-insecure-ws", false, "allow ws:// for a non-loopback development server")
+	allowPrivateICE := flag.Bool("allow-private-ice", false, "allow private-network ICE candidates for a trusted LAN call")
+	debugLog := flag.String("debug-log", "", "write diagnostic logs to this file (disabled by default)")
+	flag.Usage = usage
 	flag.Parse()
 
-	// Setup context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	f, err := tea.LogToFile("debug.log", "debug")
-	if err != nil {
-		log.Fatalf("fatal: %v", err)
-	}
-	defer f.Close()
-
-	// Two ways in: no flags -> TUI join form; or -username + -room (with
-	// -server optional). Anything in between is a partial invocation.
-	skipForm := false
-	effectiveServer := *serverURL
-	switch {
-	case *username == "" && *roomID == "" && *serverURL == "":
-		// No flags: show the join form.
-	case *username != "" && *roomID != "":
-		skipForm = true
-		if effectiveServer == "" {
-			effectiveServer = tui.DefaultServerURL
+	log.SetOutput(io.Discard)
+	if *debugLog != "" {
+		file, err := tea.LogToFile(*debugLog, "debug")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "open debug log: %v\n", err)
+			os.Exit(1)
 		}
-	default:
-		fmt.Fprintln(os.Stderr, "please pass all the arguments: -username and -room are required (-server is optional).")
+		defer file.Close()
+	}
+
+	skipForm, effectiveServer, err := invocationMode(*username, *roomID, *serverURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		flag.Usage()
 		os.Exit(2)
 	}
 
-	var p atomic.Pointer[tea.Program]
-	send := func(msg tea.Msg) {
-		if prog := p.Load(); prog != nil {
-			prog.Send(msg)
+	ctx, cancel := context.WithCancel(context.Background())
+	var cleanupMu sync.Mutex
+	var cleanup func()
+	defer func() {
+		cancel()
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+
+	var programPointer atomic.Pointer[tea.Program]
+	send := func(message tea.Msg) {
+		if program := programPointer.Load(); program != nil {
+			program.Send(message)
 		}
 	}
 
-	// We wrap the WebRTC connection logic in a function so it can be called
-	// after the user submits the form (if the form is shown).
-	startCall := func(res tui.JoinResult) (*tui.CallModel, error) {
-		log.Printf("Connecting to %s, Room: %s", res.ServerURL, res.RoomID)
-
-		sigClient, err := signaling.NewClient(ctx, res.ServerURL, res.RoomID, res.Username)
+	startCall := func(result tui.JoinResult) (*tui.CallModel, error) {
+		signalingClient, admission, err := signaling.Dial(ctx, signaling.DialOptions{
+			URL:             result.ServerURL,
+			RoomID:          result.RoomID,
+			Username:        result.Username,
+			AllowInsecureWS: *allowInsecureWS,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to connect to signaling server: %w", err)
+			return nil, fmt.Errorf("connect to signaling server: %w", err)
 		}
-		// Notice: we can't easily defer sigClient.Close() here because we are in a closure.
-		// Instead, we let the context cancellation handle it when main exits.
-		go func() {
-			<-ctx.Done()
-			sigClient.Close()
-		}()
 
-		mesh := rtc.NewMeshManager(sigClient)
-
-		cam := capture.NewCamera(15)
-		camChan, err := cam.Start(ctx)
+		mesh, err := rtc.NewMeshManagerWithOptions(ctx, signalingClient, admission, rtc.MeshOptions{
+			AllowPrivateCandidates: *allowPrivateICE,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to start camera: %v (check the camera is connected and OS privacy settings allow access)", err)
+			_ = signalingClient.Close()
+			return nil, err
 		}
+		camera := capture.NewCamera(15)
+		microphone := capture.NewMicrophone()
+		callModel := tui.NewCallModel(
+			ctx,
+			admission.RoomID,
+			mesh,
+			camera,
+			microphone,
+		)
 
-		mic := capture.NewMicrophone()
-		micTrack, err := mic.Start(ctx)
-		if err != nil {
-			log.Printf("Warning: failed to start microphone: %v", err)
-		} else {
-			mesh.SetLocalAudioTrack(micTrack)
-			go func() {
-				<-ctx.Done()
-				mic.Close()
-			}()
+		mesh.OnPeerJoin = func(peerID, peerUsername string) {
+			send(tui.PeerJoinMsg{PeerID: peerID, Username: peerUsername})
 		}
-
-		callModel := tui.NewCallModel(res.RoomID, mesh, cam, mic)
-
-		mesh.OnPeerJoin = func(peerID, username string) {
-			send(tui.PeerJoinMsg{PeerID: peerID, Username: username})
-		}
-
 		mesh.OnPeerLeave = func(peerID string) {
 			send(tui.PeerLeaveMsg{PeerID: peerID})
 		}
-
-		mesh.OnFrame = func(peerID string, frame string) {
+		mesh.OnFrame = func(peerID, frame string) {
 			send(tui.PeerFrameMsg{PeerID: peerID, Frame: frame})
 		}
+		mesh.OnError = func(callErr error) {
+			send(tui.CallErrorMsg{Err: callErr})
+		}
 
-		// Capture frames from camera
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case img, ok := <-camChan:
-					if !ok {
-						return
-					}
-					send(tui.LocalFrameMsg{RawImage: img})
-				}
-			}
-		}()
-
-		mesh.Start()
-		go func() {
-			<-ctx.Done()
+		cleanupMu.Lock()
+		cleanup = func() {
+			camera.Close()
+			microphone.Close()
 			mesh.Stop()
-		}()
-
+		}
+		cleanupMu.Unlock()
 		return callModel, nil
 	}
 
 	app := tui.NewAppModel(skipForm, *roomID, *username, effectiveServer, startCall)
-	prog := tea.NewProgram(app, tea.WithAltScreen())
-	p.Store(prog)
-
-	if _, err := prog.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
+	program := tea.NewProgram(app, tea.WithAltScreen())
+	programPointer.Store(program)
+	if _, err := program.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "run TermCall: %v\n", err)
 		os.Exit(1)
 	}
+}
 
-	log.Println("Shutting down...")
+func invocationMode(username, roomID, serverURL string) (bool, string, error) {
+	if username == "" && roomID == "" && serverURL == "" {
+		return false, "", nil
+	}
+	if username == "" || roomID == "" {
+		return false, "", errors.New("-username and -room must be provided together; -server is optional")
+	}
+	if serverURL == "" {
+		serverURL = tui.DefaultServerURL
+	}
+	return true, serverURL, nil
+}
+
+func usage() {
+	output := flag.CommandLine.Output()
+	fmt.Fprintln(output, "Usage:")
+	fmt.Fprintln(output, "  termcall")
+	fmt.Fprintln(output, "  termcall -username <name> -room <room> [-server <wss-url>]")
+	fmt.Fprintln(output)
+	fmt.Fprintln(output, "Camera and microphone start disabled. ws:// is accepted only for")
+	fmt.Fprintln(output, "loopback addresses unless -allow-insecure-ws is explicitly supplied.")
+	fmt.Fprintln(output, "Private ICE candidates are blocked unless -allow-private-ice is supplied")
+	fmt.Fprintln(output, "for a trusted LAN call.")
+	fmt.Fprintln(output)
+	fmt.Fprintln(output, "Flags:")
+	flag.PrintDefaults()
 }

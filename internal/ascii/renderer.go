@@ -78,6 +78,15 @@ func (r *ColorRenderer) GetMode() RenderMode {
 	return r.mode
 }
 
+func (r *ColorRenderer) Reset() {
+	if r.delta != nil {
+		r.delta.Reset()
+	}
+	if r.stabiliser != nil {
+		r.stabiliser.Reset()
+	}
+}
+
 // renderCells produces the cell grid for the current mode.
 func (r *ColorRenderer) renderCells(img image.Image, w, h int) [][]Cell {
 	switch r.mode {

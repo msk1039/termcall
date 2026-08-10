@@ -6,5 +6,6 @@ import "github.com/msk1039/termcall/internal/protocol"
 type SignalTransport interface {
 	Send(msg protocol.SignalingMessage) error
 	Receive() <-chan protocol.SignalingMessage
+	Errors() <-chan error
 	Close() error
 }

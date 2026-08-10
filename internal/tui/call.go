@@ -1,39 +1,45 @@
 package tui
 
 import (
+	"context"
 	"fmt"
-	"math/rand"
+	"image"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/msk1039/termcall/internal/ascii"
 	"github.com/msk1039/termcall/internal/capture"
 	"github.com/msk1039/termcall/internal/rtc"
+	"github.com/pion/webrtc/v4"
 )
 
 const (
-	// maxSendWidth and maxSendHeight cap the rendered frame dimensions sent
-	// over the network. Frames larger than this waste bandwidth because
-	// receivers display them in smaller grid cells.
-	maxSendWidth  = 100
-	maxSendHeight = 30
+	maxSendWidth  = ascii.MaxFrameWidth
+	maxSendHeight = ascii.MaxFrameHeight
 )
 
 type CallModel struct {
-	mesh   *rtc.MeshManager
-	camera *capture.Camera
-	mic    *capture.Microphone
-	camOn  bool
-	micOn  bool
+	ctx    context.Context
+	mesh   callMesh
+	camera capture.FrameSource
+	mic    microphoneCapture
+
+	cameraFrames <-chan image.Image
+	camOn        bool
+	micOn        bool
+	camStarting  bool
+	micStarting  bool
+	callError    string
 
 	width  int
 	height int
 
 	peers        []string
 	peerCells    map[string][][]ascii.Cell
-	peerLegacy   map[string]string
 	peerModes    map[string]ascii.RenderMode
 	peerNames    map[string]string
 	peerStats    map[string]rtc.PeerStats
@@ -48,317 +54,534 @@ type CallModel struct {
 	roomID     string
 }
 
-func NewCallModel(roomID string, mesh *rtc.MeshManager, camera *capture.Camera, mic *capture.Microphone) *CallModel {
+type callMesh interface {
+	Start()
+	SetLocalAudioTrack(webrtc.TrackLocal)
+	SetMuteAudio(bool)
+	BroadcastFrame([]byte)
+	RLockPeers(func(map[string]*rtc.RemotePeer))
+}
+
+type microphoneCapture interface {
+	Start(context.Context) (webrtc.TrackLocal, error)
+	LastRMS() float64
+	Close()
+}
+
+func NewCallModel(
+	ctx context.Context,
+	roomID string,
+	mesh callMesh,
+	camera capture.FrameSource,
+	mic microphoneCapture,
+) *CallModel {
 	return &CallModel{
+		ctx:          ctx,
 		roomID:       roomID,
 		mesh:         mesh,
 		camera:       camera,
 		mic:          mic,
-		camOn:        true,
-		micOn:        true,
-		peerCells:    make(map[string][][]ascii.Cell),
-		peerLegacy:   make(map[string]string),
-		peerModes:    make(map[string]ascii.RenderMode),
-		peerNames:    make(map[string]string),
-		peerStats:    make(map[string]rtc.PeerStats),
-		peerVolumes:  make(map[string]float64),
-		removedPeers: make(map[string]bool),
-		peerDecoders: make(map[string]*ascii.DeltaDecoder),
+		peers:        []string{},
+		peerCells:    map[string][][]ascii.Cell{},
+		peerModes:    map[string]ascii.RenderMode{},
+		peerNames:    map[string]string{},
+		peerStats:    map[string]rtc.PeerStats{},
+		peerVolumes:  map[string]float64{},
+		removedPeers: map[string]bool{},
+		peerDecoders: map[string]*ascii.DeltaDecoder{},
+		localCells:   [][]ascii.Cell{},
 		renderer:     ascii.NewColorRenderer(ascii.ModeHalfBlock),
 	}
 }
 
 func tickStats() tea.Cmd {
-	return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
 		return StatsTickMsg{}
 	})
 }
 
 func tickVolume() tea.Cmd {
-	return tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
 		return VolumeTickMsg{}
 	})
 }
 
-func (m *CallModel) Init() tea.Cmd {
-	return tea.Batch(tickStats(), tickVolume())
+func (model *CallModel) Init() tea.Cmd {
+	startMesh := func() tea.Msg {
+		model.mesh.Start()
+		return nil
+	}
+	return tea.Batch(startMesh, tickStats(), tickVolume())
 }
 
-func (m *CallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
+func (model *CallModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	switch message := message.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
+		switch message.String() {
 		case "ctrl+c", "q":
-			return m, tea.Quit
+			model.camera.Close()
+			model.mic.Close()
+			return model, tea.Quit
 		case "v":
-			m.camOn = !m.camOn
-			if !m.camOn {
-				m.mesh.BroadcastFrame([]byte("Camera Off"))
-			}
-			return m, nil
+			return model.toggleCamera()
 		case "m":
-			m.micOn = !m.micOn
-			m.mesh.SetMuteAudio(!m.micOn)
-			return m, nil
+			return model.toggleMicrophone()
 		case "s":
-			m.showStats = !m.showStats
-			return m, nil
+			model.showStats = !model.showStats
+			return model, nil
 		case "n":
-			current := m.renderer.GetMode()
-			next := (int(current) + 1) % 3
-			m.renderer.SetMode(ascii.RenderMode(next))
-			return m, nil
+			currentMode := model.renderer.GetMode()
+			nextMode := (int(currentMode) + 1) % 3
+			model.renderer.SetMode(ascii.RenderMode(nextMode))
+			return model, nil
 		}
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		model.width = message.Width
+		model.height = message.Height
 	case PeerJoinMsg:
-		m.AddPeer(msg.PeerID, msg.Username)
-		return m, nil
+		model.AddPeer(message.PeerID, message.Username)
+		return model, nil
 	case PeerLeaveMsg:
-		m.RemovePeer(msg.PeerID)
-		return m, nil
+		model.RemovePeer(message.PeerID)
+		return model, nil
 	case PeerFrameMsg:
-		if m.removedPeers[msg.PeerID] {
-			return m, nil
+		model.handlePeerFrame(message)
+		return model, nil
+	case CameraStartedMsg:
+		model.camStarting = false
+		if message.Err != nil {
+			model.setError(fmt.Errorf("camera: %w", message.Err))
+			return model, nil
 		}
-		if _, ok := m.peerNames[msg.PeerID]; !ok {
-			m.peerNames[msg.PeerID] = "Peer " + msg.PeerID
-			m.peers = append(m.peers, msg.PeerID)
-		}
-		dec, ok := m.peerDecoders[msg.PeerID]
-		if !ok {
-			dec = ascii.NewDeltaDecoder()
-			m.peerDecoders[msg.PeerID] = dec
-		}
-		cells, mode, isGrid := dec.DecodeCells(msg.Frame)
-		if isGrid {
-			m.peerCells[msg.PeerID] = cells
-			m.peerModes[msg.PeerID] = mode
-		} else {
-			if len(msg.Frame) > 0 && (msg.Frame[0] == 'K' || msg.Frame[0] == 'D') {
-				// failed decode, do nothing
-			} else {
-				m.peerLegacy[msg.PeerID] = msg.Frame
-			}
-		}
-		return m, nil
+		model.cameraFrames = message.Frames
+		model.camOn = true
+		model.renderer.Reset()
+		model.callError = ""
+		return model, waitForCameraFrame(message.Frames)
 	case LocalFrameMsg:
-		if m.camOn {
-			cells, sendStr := m.renderer.ConvertCells(msg.RawImage, maxSendWidth, maxSendHeight)
-			m.localCells = cells
-			m.mesh.BroadcastFrame([]byte(sendStr))
-		} else {
-			m.localCells = nil
+		return model.handleLocalFrame(message)
+	case MicrophoneStartedMsg:
+		model.micStarting = false
+		if message.Err != nil {
+			model.setError(fmt.Errorf("microphone: %w", message.Err))
+			return model, nil
 		}
-		return m, nil
+		model.mesh.SetLocalAudioTrack(message.Track)
+		model.mesh.SetMuteAudio(false)
+		model.micOn = true
+		model.callError = ""
+		return model, nil
+	case CallErrorMsg:
+		model.setError(message.Err)
+		return model, nil
 	case StatsTickMsg:
-		m.mesh.RLockPeers(func(peers map[string]*rtc.RemotePeer) {
-			for pid, p := range peers {
-				p.UpdateStats(2.0)
-				m.peerStats[pid] = p.Stats
+		model.mesh.RLockPeers(func(peers map[string]*rtc.RemotePeer) {
+			for peerID, peer := range peers {
+				peer.UpdateStats(2)
+				model.peerStats[peerID] = peer.StatsSnapshot()
 			}
 		})
-		return m, tickStats()
+		return model, tickStats()
 	case VolumeTickMsg:
-		if m.micOn {
-			// Mocking local volume pseudo-randomly for visual feedback
-			// since intercepting hardware audio streams cleanly is complex via CGO.
-			m.localVolume = 0.05 + rand.Float64()*0.2
-		} else {
-			m.localVolume = 0.0
-		}
-
-		m.mesh.RLockPeers(func(peers map[string]*rtc.RemotePeer) {
-			for pid, p := range peers {
-				if p.Player != nil {
-					m.peerVolumes[pid] = p.Player.LastRMS()
+		model.localVolume = 0
+		model.mesh.RLockPeers(func(peers map[string]*rtc.RemotePeer) {
+			for peerID, peer := range peers {
+				if player := peer.Player(); player != nil {
+					model.peerVolumes[peerID] = player.LastRMS()
 				}
 			}
 		})
-		return m, tickVolume()
+		return model, tickVolume()
 	}
-	return m, nil
+	return model, nil
 }
 
-func (m *CallModel) View() string {
-	theme := GetCurrentTheme()
+func (model *CallModel) toggleCamera() (tea.Model, tea.Cmd) {
+	if model.camStarting {
+		return model, nil
+	}
+	if model.camOn {
+		model.camera.Close()
+		model.camOn = false
+		model.cameraFrames = nil
+		model.localCells = [][]ascii.Cell{}
+		model.renderer.Reset()
+		model.mesh.BroadcastFrame([]byte(ascii.StatusFrame("Camera off")))
+		return model, nil
+	}
 
-	if m.width == 0 || m.height == 0 {
+	model.camStarting = true
+	model.callError = ""
+	return model, startCamera(model.ctx, model.camera)
+}
+
+func (model *CallModel) toggleMicrophone() (tea.Model, tea.Cmd) {
+	if model.micStarting {
+		return model, nil
+	}
+	if model.micOn {
+		model.mesh.SetMuteAudio(true)
+		model.mic.Close()
+		model.micOn = false
+		model.localVolume = 0
+		return model, nil
+	}
+
+	model.micStarting = true
+	model.callError = ""
+	return model, startMicrophone(model.ctx, model.mic)
+}
+
+func (model *CallModel) handlePeerFrame(message PeerFrameMsg) {
+	if model.removedPeers[message.PeerID] {
+		return
+	}
+	if _, exists := model.peerNames[message.PeerID]; !exists {
+		model.peerNames[message.PeerID] = "Peer " + message.PeerID
+		model.peers = append(model.peers, message.PeerID)
+	}
+	if message.Frame == ascii.StatusFrame("Camera off") {
+		delete(model.peerCells, message.PeerID)
+		delete(model.peerModes, message.PeerID)
+		return
+	}
+	decoder, exists := model.peerDecoders[message.PeerID]
+	if !exists {
+		decoder = ascii.NewDeltaDecoder()
+		model.peerDecoders[message.PeerID] = decoder
+	}
+	cells, mode, err := decoder.DecodeCells(message.Frame)
+	if err != nil {
+		model.callError = "Dropped an invalid video frame from " + model.peerNames[message.PeerID]
+		return
+	}
+	model.peerCells[message.PeerID] = cells
+	model.peerModes[message.PeerID] = mode
+}
+
+func (model *CallModel) handleLocalFrame(message LocalFrameMsg) (tea.Model, tea.Cmd) {
+	if message.Source != model.cameraFrames {
+		return model, nil
+	}
+	if message.Closed {
+		model.cameraFrames = nil
+		if model.camOn {
+			model.camOn = false
+			model.callError = "Camera stream stopped"
+		}
+		return model, nil
+	}
+	if model.camOn && message.RawImage != nil {
+		cells, encoded := model.renderer.ConvertCells(message.RawImage, maxSendWidth, maxSendHeight)
+		if encoded != "" {
+			model.localCells = cells
+			model.mesh.BroadcastFrame([]byte(encoded))
+		}
+	}
+	return model, waitForCameraFrame(model.cameraFrames)
+}
+
+func startCamera(ctx context.Context, camera capture.FrameSource) tea.Cmd {
+	return func() tea.Msg {
+		frames, err := camera.Start(ctx)
+		return CameraStartedMsg{Frames: frames, Err: err}
+	}
+}
+
+func waitForCameraFrame(frames <-chan image.Image) tea.Cmd {
+	return func() tea.Msg {
+		frame, ok := <-frames
+		return LocalFrameMsg{
+			RawImage: frame,
+			Source:   frames,
+			Closed:   !ok,
+		}
+	}
+}
+
+func startMicrophone(ctx context.Context, microphone microphoneCapture) tea.Cmd {
+	return func() tea.Msg {
+		track, err := microphone.Start(ctx)
+		return MicrophoneStartedMsg{Track: track, Err: err}
+	}
+}
+
+func (model *CallModel) setError(err error) {
+	if err == nil {
+		return
+	}
+	var builder strings.Builder
+	for _, char := range err.Error() {
+		if unicode.IsPrint(char) && !unicode.IsControl(char) {
+			builder.WriteRune(char)
+		}
+		if builder.Len() >= 160 {
+			break
+		}
+	}
+	model.callError = builder.String()
+}
+
+func (model *CallModel) View() string {
+	theme := GetCurrentTheme()
+	if model.width == 0 || model.height == 0 {
 		return ""
 	}
 
-	// Calculate overall ping and loss for the top bar
-	var maxPing float64 = 0
-	var totalLoss uint32 = 0
-	var localOutgoingKBps float64 = 0
-	var localAudioOutKBps float64 = 0
-
-	for _, pid := range m.peers {
-		stats := m.peerStats[pid]
+	var maxPing float64
+	var totalLoss uint32
+	var localOutgoingKBps float64
+	var localAudioOutKBps float64
+	for _, peerID := range model.peers {
+		stats := model.peerStats[peerID]
 		if stats.RTTMs > maxPing {
 			maxPing = stats.RTTMs
 		}
 		totalLoss += stats.PacketsLost
-		// Approximate total outgoing as max of any peer's outgoing (since it's a broadcast)
 		if stats.OutgoingKBps > localOutgoingKBps {
 			localOutgoingKBps = stats.OutgoingKBps
 			localAudioOutKBps = stats.AudioOutKBps
 		}
 	}
 
-	titleText := lipgloss.NewStyle().Bold(true).Foreground(theme.TitleFg).Background(theme.TitleBg).Padding(0, 1).Render(fmt.Sprintf(" TermCall | Room: %s ", m.roomID))
-	titleEnd := lipgloss.NewStyle().Foreground(theme.TitleBg).Background(theme.ControlBarBg).Render("")
+	titleText := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(theme.TitleFg).
+		Background(theme.TitleBg).
+		Padding(0, 1).
+		Render(fmt.Sprintf(" TermCall | Room: %s ", model.roomID))
+	titleEnd := lipgloss.NewStyle().
+		Foreground(theme.TitleBg).
+		Background(theme.ControlBarBg).
+		Render("")
 	titlePart := lipgloss.JoinHorizontal(lipgloss.Top, titleText, titleEnd)
 
 	var statsPart string
-	if m.showStats && len(m.peers) > 0 {
-		statsStart := lipgloss.NewStyle().Foreground(theme.StatsBg).Background(theme.ControlBarBg).Render("")
-		statsText := lipgloss.NewStyle().Bold(true).Foreground(theme.StatusFg).Background(theme.StatsBg).Padding(0, 1).Render(fmt.Sprintf("Loss: %d | Ping: %.0f ms", totalLoss, maxPing))
+	if model.showStats && len(model.peers) > 0 {
+		statsStart := lipgloss.NewStyle().
+			Foreground(theme.StatsBg).
+			Background(theme.ControlBarBg).
+			Render("")
+		statsText := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(theme.StatusFg).
+			Background(theme.StatsBg).
+			Padding(0, 1).
+			Render(fmt.Sprintf("Loss: %d | Ping: %.0f ms", totalLoss, maxPing))
 		statsPart = lipgloss.JoinHorizontal(lipgloss.Top, statsStart, statsText)
 	}
 
-	spacerW := m.width - lipgloss.Width(titlePart) - lipgloss.Width(statsPart)
-	if spacerW < 0 {
-		spacerW = 0
+	spacerWidth := model.width - lipgloss.Width(titlePart) - lipgloss.Width(statsPart)
+	if spacerWidth < 0 {
+		spacerWidth = 0
 	}
-	spacer := lipgloss.NewStyle().Width(spacerW).Background(theme.ControlBarBg).Render("")
-
+	spacer := lipgloss.NewStyle().
+		Width(spacerWidth).
+		Background(theme.ControlBarBg).
+		Render("")
 	titleBar := lipgloss.JoinHorizontal(lipgloss.Top, titlePart, spacer, statsPart)
 
-	modeStr := "ASCII"
-	if m.renderer.GetMode() == ascii.ModeColor256 {
-		modeStr = "Color256"
-	} else if m.renderer.GetMode() == ascii.ModeHalfBlock {
-		modeStr = "HalfBlock"
+	statusBar := ""
+	if model.callError != "" {
+		statusBar = lipgloss.NewStyle().
+			Width(model.width).
+			Foreground(theme.InactiveBtnFg).
+			Background(theme.InactiveBtnBg).
+			Render(" " + ansi.Truncate(model.callError, max(1, model.width-2), "…"))
 	}
 
-	controlBar := renderControls(m.width, m.camOn, m.micOn, m.showStats, modeStr, theme)
-	controlH := lipgloss.Height(controlBar)
-
-	availH := m.height - lipgloss.Height(titleBar) - controlH
-	if availH < 0 {
-		availH = 0
+	modeName := "ASCII"
+	switch model.renderer.GetMode() {
+	case ascii.ModeColor256:
+		modeName = "Color256"
+	case ascii.ModeHalfBlock:
+		modeName = "HalfBlock"
 	}
+	controlBar := renderControls(
+		model.width,
+		model.camOn,
+		model.micOn,
+		model.showStats,
+		modeName,
+		theme,
+	)
 
-	totalPeers := len(m.peers) + 1
-	cols, boxW, boxH, innerW, innerH := computeGrid(totalPeers, m.width, availH)
-
-	var cells []string
-
-	// Local cell
-	localFrameStr := ""
-	if !m.camOn {
-		localFrameStr = "Camera Off"
-	} else if m.localCells != nil {
-		localFrameStr = ascii.SerialiseMode(m.localCells, m.renderer.GetMode())
-	} else {
-		localFrameStr = "Waiting for camera..."
+	availableHeight := model.height - lipgloss.Height(titleBar) - lipgloss.Height(statusBar) - lipgloss.Height(controlBar)
+	if availableHeight < 0 {
+		availableHeight = 0
 	}
-	localName := "You (Local)" + renderVoiceActivity(m.localVolume, theme)
+	columns, boxWidth, boxHeight, innerWidth, innerHeight := computeGrid(
+		len(model.peers)+1,
+		model.width,
+		availableHeight,
+	)
 
-	var localStatsStr string
-	if m.showStats {
-		mockLocalStats := rtc.PeerStats{OutgoingKBps: localOutgoingKBps, AudioOutKBps: localAudioOutKBps}
-		localStatsStr = renderOutgoingStats(mockLocalStats, theme)
+	videoCells := make([]string, 0, len(model.peers)+1)
+	localFrame := "Camera off"
+	showCameraOffPlaceholder := !model.camOn && !model.camStarting
+	if model.camStarting {
+		localFrame = "Starting camera..."
+	} else if model.camOn && len(model.localCells) > 0 {
+		localFrame = ascii.SerialiseMode(model.localCells, model.renderer.GetMode())
+	} else if model.camOn {
+		localFrame = "Waiting for camera..."
 	}
-	cells = append(cells, renderCellTmux(localName, localFrameStr, localStatsStr, boxW, boxH, innerW, innerH, theme))
+	localName := "You (Local)" + renderVoiceActivity(model.localVolume, theme)
+	var localStats string
+	if model.showStats {
+		localStats = renderOutgoingStats(rtc.PeerStats{
+			OutgoingKBps: localOutgoingKBps,
+			AudioOutKBps: localAudioOutKBps,
+		}, theme)
+	}
+	videoCells = append(videoCells, renderCellTmux(videoCellOptions{
+		name:                     localName,
+		frame:                    localFrame,
+		showCameraOffPlaceholder: showCameraOffPlaceholder,
+		stats:                    localStats,
+		boxWidth:                 boxWidth,
+		boxHeight:                boxHeight,
+		maxInnerWidth:            innerWidth,
+		maxInnerHeight:           innerHeight,
+		theme:                    theme,
+	}))
 
-	// Remote cells
-	for _, p := range m.peers {
-		name := m.peerNames[p] + renderVoiceActivity(m.peerVolumes[p], theme)
-		var frame string
-		if cells, ok := m.peerCells[p]; ok && cells != nil {
-			mode := m.peerModes[p]
-			frame = ascii.SerialiseMode(cells, mode)
-		} else if legacy, ok := m.peerLegacy[p]; ok {
-			frame = legacy
-		} else {
-			frame = "Waiting for video..."
+	for _, peerID := range model.peers {
+		name := model.peerNames[peerID] + renderVoiceActivity(model.peerVolumes[peerID], theme)
+		frame := "Camera off"
+		showCameraOffPlaceholder := true
+		if cells := model.peerCells[peerID]; len(cells) > 0 {
+			frame = ascii.SerialiseMode(cells, model.peerModes[peerID])
+			showCameraOffPlaceholder = false
 		}
-
-		var remoteStatsStr string
-		if m.showStats {
-			remoteStatsStr = renderIncomingStats(m.peerStats[p], theme)
+		var remoteStats string
+		if model.showStats {
+			remoteStats = renderIncomingStats(model.peerStats[peerID], theme)
 		}
-
-		cells = append(cells, renderCellTmux(name, frame, remoteStatsStr, boxW, boxH, innerW, innerH, theme))
+		videoCells = append(videoCells, renderCellTmux(videoCellOptions{
+			name:                     name,
+			frame:                    frame,
+			showCameraOffPlaceholder: showCameraOffPlaceholder,
+			stats:                    remoteStats,
+			boxWidth:                 boxWidth,
+			boxHeight:                boxHeight,
+			maxInnerWidth:            innerWidth,
+			maxInnerHeight:           innerHeight,
+			theme:                    theme,
+		}))
 	}
 
-	var rows []string
-	for i := 0; i < len(cells); i += cols {
-		end := i + cols
-		if end > len(cells) {
-			end = len(cells)
-		}
-		rowStr := lipgloss.JoinHorizontal(lipgloss.Top, cells[i:end]...)
-		rows = append(rows, rowStr)
+	rows := make([]string, 0, (len(videoCells)+columns-1)/columns)
+	for index := 0; index < len(videoCells); index += columns {
+		end := min(index+columns, len(videoCells))
+		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, videoCells[index:end]...))
 	}
+	grid := lipgloss.JoinVertical(lipgloss.Center, rows...)
+	gridArea := lipgloss.Place(model.width, availableHeight, lipgloss.Center, lipgloss.Center, grid)
 
-	gridStr := lipgloss.JoinVertical(lipgloss.Center, rows...)
-	gridArea := lipgloss.Place(m.width, availH, lipgloss.Center, lipgloss.Center, gridStr)
-
-	return lipgloss.JoinVertical(lipgloss.Left, titleBar, gridArea, controlBar)
+	return lipgloss.JoinVertical(lipgloss.Left, titleBar, statusBar, gridArea, controlBar)
 }
 
-func renderCellTmux(name, frame, statsStr string, boxW, boxH, maxInnerW, maxInnerH int, theme Theme) string {
-	lines := strings.Split(frame, "\n")
-	if len(lines) > maxInnerH {
-		lines = lines[:maxInnerH]
+type videoCellOptions struct {
+	name                     string
+	frame                    string
+	showCameraOffPlaceholder bool
+	stats                    string
+	boxWidth                 int
+	boxHeight                int
+	maxInnerWidth            int
+	maxInnerHeight           int
+	theme                    Theme
+}
+
+func renderCellTmux(options videoCellOptions) string {
+	safeFrame := options.frame
+	if options.showCameraOffPlaceholder {
+		safeFrame = cameraOffPlaceholder(
+			options.maxInnerWidth,
+			options.maxInnerHeight,
+			options.theme,
+		)
+	} else {
+		lines := strings.Split(options.frame, "\n")
+		if len(lines) > options.maxInnerHeight {
+			lines = lines[:options.maxInnerHeight]
+		}
+		for index, line := range lines {
+			lines[index] = ansi.Truncate(line, options.maxInnerWidth, "")
+		}
+		safeFrame = strings.Join(lines, "\n")
 	}
-	safeFrame := strings.Join(lines, "\n")
 
-	actualW := lipgloss.Width(safeFrame)
-	if actualW == 0 || actualW > maxInnerW {
-		actualW = maxInnerW
-	}
-
-	nameBg := theme.ActiveBtnBg
-	nameFg := theme.ActiveBtnFg
-
-	nameLabel := lipgloss.NewStyle().Background(nameBg).Foreground(nameFg).Bold(true).PaddingLeft(1).Render(name)
-	nameArrow := lipgloss.NewStyle().Background(theme.BorderColor).Foreground(nameBg).Render("")
-
+	name := ansi.Truncate(options.name, max(1, options.maxInnerWidth/2), "…")
+	nameLabel := lipgloss.NewStyle().
+		Background(options.theme.ActiveBtnBg).
+		Foreground(options.theme.ActiveBtnFg).
+		Bold(true).
+		PaddingLeft(1).
+		Render(name)
+	nameArrow := lipgloss.NewStyle().
+		Background(options.theme.BorderColor).
+		Foreground(options.theme.ActiveBtnBg).
+		Render("")
 	topBarLeft := lipgloss.JoinHorizontal(lipgloss.Top, nameLabel, nameArrow)
 
 	topBarRight := ""
-	if statsStr != "" {
-		statsArrow := lipgloss.NewStyle().Background(theme.BorderColor).Foreground(theme.StatsBg).Render("")
-		topBarRight = lipgloss.JoinHorizontal(lipgloss.Top, statsArrow, statsStr)
+	if options.stats != "" {
+		stats := ansi.Truncate(options.stats, max(1, options.maxInnerWidth-lipgloss.Width(topBarLeft)-1), "…")
+		statsArrow := lipgloss.NewStyle().
+			Background(options.theme.BorderColor).
+			Foreground(options.theme.StatsBg).
+			Render("")
+		topBarRight = lipgloss.JoinHorizontal(lipgloss.Top, statsArrow, stats)
 	}
 
-	fillerW := actualW - lipgloss.Width(topBarLeft) - lipgloss.Width(topBarRight)
-	if fillerW < 0 {
-		fillerW = 0
+	fillerWidth := options.maxInnerWidth - lipgloss.Width(topBarLeft) - lipgloss.Width(topBarRight)
+	if fillerWidth < 0 {
+		fillerWidth = 0
 	}
-	filler := lipgloss.NewStyle().Background(theme.BorderColor).Width(fillerW).Render("")
-
+	filler := lipgloss.NewStyle().
+		Background(options.theme.BorderColor).
+		Width(fillerWidth).
+		Render("")
 	topBar := lipgloss.JoinHorizontal(lipgloss.Top, topBarLeft, filler, topBarRight)
-
 	content := lipgloss.JoinVertical(lipgloss.Center, topBar, safeFrame)
-	return lipgloss.Place(boxW, boxH, lipgloss.Center, lipgloss.Center, content)
+	return lipgloss.Place(options.boxWidth, options.boxHeight, lipgloss.Center, lipgloss.Center, content)
 }
 
-func (m *CallModel) AddPeer(peerID, username string) {
-	if _, ok := m.peerNames[peerID]; !ok {
-		m.peers = append(m.peers, peerID)
+func cameraOffPlaceholder(width, height int, theme Theme) string {
+	if width < 1 || height < 1 {
+		return ""
 	}
-	m.peerNames[peerID] = username
+	return lipgloss.NewStyle().
+		Width(width).
+		Height(height).
+		Align(lipgloss.Center, lipgloss.Center).
+		Foreground(theme.CameraOffFg).
+		Background(theme.CameraOffBg).
+		Render("Camera off")
 }
 
-func (m *CallModel) RemovePeer(peerID string) {
-	for i, p := range m.peers {
-		if p == peerID {
-			m.peers = append(m.peers[:i], m.peers[i+1:]...)
+func (model *CallModel) AddPeer(peerID, username string) {
+	if _, exists := model.peerNames[peerID]; !exists {
+		model.peers = append(model.peers, peerID)
+	}
+	model.peerNames[peerID] = username
+	delete(model.removedPeers, peerID)
+}
+
+func (model *CallModel) RemovePeer(peerID string) {
+	for index, existingPeerID := range model.peers {
+		if existingPeerID == peerID {
+			model.peers = append(model.peers[:index], model.peers[index+1:]...)
 			break
 		}
 	}
-	delete(m.peerNames, peerID)
-	delete(m.peerCells, peerID)
-	delete(m.peerLegacy, peerID)
-	delete(m.peerModes, peerID)
-	delete(m.peerStats, peerID)
-	delete(m.peerVolumes, peerID)
-	delete(m.peerDecoders, peerID)
-	m.removedPeers[peerID] = true
+	delete(model.peerNames, peerID)
+	delete(model.peerCells, peerID)
+	delete(model.peerModes, peerID)
+	delete(model.peerStats, peerID)
+	delete(model.peerVolumes, peerID)
+	delete(model.peerDecoders, peerID)
+	model.removedPeers[peerID] = true
 }

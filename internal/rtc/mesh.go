@@ -1,19 +1,29 @@
 package rtc
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/netip"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/msk1039/termcall/internal/ascii"
 	"github.com/msk1039/termcall/internal/playback"
 	"github.com/msk1039/termcall/internal/protocol"
 	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
+	"golang.org/x/time/rate"
+)
+
+const (
+	maxBufferedAmount     = 64 * 1024
+	disconnectGracePeriod = 10 * time.Second
 )
 
 type MeshManager struct {
@@ -22,572 +32,650 @@ type MeshManager struct {
 	Peers       map[string]*RemotePeer
 	mu          sync.RWMutex
 
-	signaler   SignalTransport
-	webrtcAPI  *webrtc.API
-	iceServers []webrtc.ICEServer
+	signaler     SignalTransport
+	webrtcAPI    *webrtc.API
+	iceServers   []webrtc.ICEServer
+	initialPeers []protocol.PeerInfo
 
-	localAudioTrack webrtc.TrackLocal
-	isMuted         bool
+	localAudioTrack  webrtc.TrackLocal
+	silentAudioTrack webrtc.TrackLocal
+	isMuted          bool
 
-	// Callbacks
 	OnFrame     func(peerID string, frame string)
 	OnPeerJoin  func(peerID, username string)
 	OnPeerLeave func(peerID string)
+	OnError     func(error)
 
-	// Context for graceful shutdown
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
+	startOnce sync.Once
+	stopOnce  sync.Once
+	wg        sync.WaitGroup
 }
 
-func NewMeshManager(signaler SignalTransport) *MeshManager {
-	ctx, cancel := context.WithCancel(context.Background())
+type MeshOptions struct {
+	AllowPrivateCandidates bool
+}
 
-	// Prepare MediaEngine (will add Opus later)
-	m := &webrtc.MediaEngine{}
-	if err := m.RegisterDefaultCodecs(); err != nil {
-		log.Fatalf("Failed to register codecs: %v", err)
+func NewMeshManager(
+	parent context.Context,
+	signaler SignalTransport,
+	admission protocol.JoinAcceptedPayload,
+) (*MeshManager, error) {
+	return NewMeshManagerWithOptions(parent, signaler, admission, MeshOptions{})
+}
+
+func NewMeshManagerWithOptions(
+	parent context.Context,
+	signaler SignalTransport,
+	admission protocol.JoinAcceptedPayload,
+	options MeshOptions,
+) (*MeshManager, error) {
+	if signaler == nil {
+		return nil, errors.New("signaling transport is required")
+	}
+	if err := protocol.ValidatePeerID(admission.PeerID); err != nil {
+		return nil, fmt.Errorf("local peer ID: %w", err)
 	}
 
-	s := webrtc.SettingEngine{}
-	s.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(s))
+	mediaEngine := &webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		return nil, fmt.Errorf("register WebRTC codecs: %w", err)
+	}
+	settingEngine := webrtc.SettingEngine{}
+	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeQueryAndGather)
+	settingEngine.SetRemoteIPFilter(func(ip net.IP) bool {
+		return remoteCandidateAllowedWithPrivate(ip, options.AllowPrivateCandidates)
+	})
+	settingEngine.SetSCTPMaxMessageSize(uint32(ascii.MaxEncodedFrameBytes + 21))
+	settingEngine.SetSCTPMaxReceiveBufferSize(1024 * 1024)
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(mediaEngine),
+		webrtc.WithSettingEngine(settingEngine),
+	)
+	silentAudioTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeOpus,
+			ClockRate: 48000,
+			Channels:  2,
+		},
+		"audio",
+		"termcall",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create silent audio track: %w", err)
+	}
 
+	iceServers := make([]webrtc.ICEServer, 0, len(admission.ICEServers))
+	for _, server := range admission.ICEServers {
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:       append([]string{}, server.URLs...),
+			Username:   server.Username,
+			Credential: server.Credential,
+		})
+	}
+	ctx, cancel := context.WithCancel(parent)
 	return &MeshManager{
-		Peers:     make(map[string]*RemotePeer),
-		signaler:  signaler,
-		webrtcAPI: api,
-		ctx:       ctx,
-		cancel:    cancel,
-	}
+		LocalPeerID: admission.PeerID,
+		Peers:       map[string]*RemotePeer{},
+		signaler:    signaler,
+		webrtcAPI:   api,
+		iceServers:  iceServers,
+		initialPeers: append(
+			[]protocol.PeerInfo{},
+			admission.Peers...,
+		),
+		silentAudioTrack: silentAudioTrack,
+		isMuted:          true,
+		ctx:              ctx,
+		cancel:           cancel,
+	}, nil
 }
 
-func (m *MeshManager) Start() {
-	go m.readSignalingLoop()
-}
-
-func (m *MeshManager) Stop() {
-	m.cancel()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, p := range m.Peers {
-		p.Close()
-	}
-}
-
-// RLockPeers allows safe read-only access to the Peers map for diagnostics.
-func (m *MeshManager) RLockPeers(fn func(peers map[string]*RemotePeer)) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	fn(m.Peers)
-}
-
-func (m *MeshManager) SetICEServers(servers []webrtc.ICEServer) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.iceServers = servers
-}
-
-func (m *MeshManager) SetLocalAudioTrack(track webrtc.TrackLocal) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.localAudioTrack = track
-}
-
-// SetMuteAudio mutes or unmutes the local audio sent to all peers.
-func (m *MeshManager) SetMuteAudio(muted bool) {
-	m.mu.Lock()
-	m.isMuted = muted
-	localTrack := m.localAudioTrack
-	m.mu.Unlock()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, p := range m.Peers {
-		if p.AudioSender != nil {
-			if muted {
-				_ = p.AudioSender.ReplaceTrack(nil)
-			} else {
-				_ = p.AudioSender.ReplaceTrack(localTrack)
-			}
+func (manager *MeshManager) Start() {
+	manager.startOnce.Do(func() {
+		for _, peer := range manager.initialPeers {
+			message := protocol.NewMessage(protocol.MsgPeerJoined)
+			message.PeerID = peer.PeerID
+			message.Username = peer.Username
+			manager.handlePeerJoined(message)
 		}
-	}
+		manager.initialPeers = []protocol.PeerInfo{}
+
+		manager.wg.Add(1)
+		go func() {
+			defer manager.wg.Done()
+			manager.readSignalingLoop()
+		}()
+	})
 }
 
-// maxBufferedAmount is the maximum number of bytes allowed in the DataChannel's
-// SCTP send buffer before we start dropping frames. This prevents buffer bloat
-// when the network is congested — without it, frames pile up during congestion
-// and replay in a burst when the network recovers.
-const maxBufferedAmount = 64 * 1024 // 64 KB
+func (manager *MeshManager) Stop() {
+	manager.stopOnce.Do(func() {
+		manager.cancel()
+		_ = manager.signaler.Close()
 
-func (m *MeshManager) BroadcastFrame(frame []byte) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+		manager.mu.Lock()
+		peers := make([]*RemotePeer, 0, len(manager.Peers))
+		for peerID, peer := range manager.Peers {
+			peers = append(peers, peer)
+			delete(manager.Peers, peerID)
+		}
+		manager.mu.Unlock()
 
-	// Tag the frame with a monotonically increasing sequence number so the
-	// receiver can drop stale frames that arrive out of order.
-	seq := m.frameSeq.Add(1)
-	tagged := fmt.Sprintf("%d\n%s", seq, string(frame))
+		for _, peer := range peers {
+			peer.Close()
+		}
+		manager.wg.Wait()
+	})
+}
 
-	for _, p := range m.Peers {
-		if p.DataChan == nil || p.DataChan.ReadyState() != webrtc.DataChannelStateOpen {
+func (manager *MeshManager) RLockPeers(callback func(peers map[string]*RemotePeer)) {
+	manager.mu.RLock()
+	snapshot := make(map[string]*RemotePeer, len(manager.Peers))
+	for peerID, peer := range manager.Peers {
+		snapshot[peerID] = peer
+	}
+	manager.mu.RUnlock()
+	callback(snapshot)
+}
+
+func (manager *MeshManager) SetLocalAudioTrack(track webrtc.TrackLocal) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.localAudioTrack = track
+}
+
+func (manager *MeshManager) SetMuteAudio(muted bool) {
+	manager.mu.Lock()
+	manager.isMuted = muted
+	localTrack := manager.localAudioTrack
+	if muted || localTrack == nil {
+		localTrack = manager.silentAudioTrack
+	}
+	peers := make([]*RemotePeer, 0, len(manager.Peers))
+	for _, peer := range manager.Peers {
+		peers = append(peers, peer)
+	}
+	manager.mu.Unlock()
+
+	for _, peer := range peers {
+		if peer.AudioSender == nil {
 			continue
 		}
-		// Drop the frame if the send buffer is backed up for this peer. Queued
-		// frames arrive late and cause a "replay" effect on the receiver, so
-		// skipping is better than piling on more data.
-		if p.DataChan.BufferedAmount() > maxBufferedAmount {
+		if err := peer.AudioSender.ReplaceTrack(localTrack); err != nil {
+			manager.notifyError(fmt.Errorf("update audio track for peer %s: %w", peer.PeerID, err))
+		}
+	}
+}
+
+func (manager *MeshManager) BroadcastFrame(frame []byte) {
+	if len(frame) == 0 || len(frame) > ascii.MaxEncodedFrameBytes {
+		return
+	}
+	sequence := manager.frameSeq.Add(1)
+	tagged := strconv.FormatUint(sequence, 10) + "\n" + string(frame)
+
+	manager.mu.RLock()
+	peers := make([]*RemotePeer, 0, len(manager.Peers))
+	for _, peer := range manager.Peers {
+		peers = append(peers, peer)
+	}
+	manager.mu.RUnlock()
+
+	for _, peer := range peers {
+		channel := peer.DataChannel()
+		if channel == nil || channel.ReadyState() != webrtc.DataChannelStateOpen {
 			continue
 		}
-		if err := p.DataChan.SendText(tagged); err != nil {
-			// Send errors are non-fatal for individual frames.
+		if channel.BufferedAmount() > maxBufferedAmount {
+			continue
+		}
+		_ = channel.SendText(tagged)
+	}
+}
+
+func parseTaggedFrame(raw []byte) (uint64, string, bool) {
+	if len(raw) > ascii.MaxEncodedFrameBytes+21 {
+		return 0, "", false
+	}
+	newline := bytes.IndexByte(raw, '\n')
+	if newline < 1 || newline > 20 {
+		return 0, "", false
+	}
+	sequence, err := strconv.ParseUint(string(raw[:newline]), 10, 64)
+	if err != nil || sequence == 0 {
+		return 0, "", false
+	}
+	frame := raw[newline+1:]
+	if len(frame) == 0 || len(frame) > ascii.MaxEncodedFrameBytes {
+		return 0, "", false
+	}
+	return sequence, string(frame), true
+}
+
+var deniedRemoteCandidatePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+func remoteCandidateAllowed(ip net.IP) bool {
+	return remoteCandidateAllowedWithPrivate(ip, false)
+}
+
+func remoteCandidateAllowedWithPrivate(ip net.IP, allowPrivate bool) bool {
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	address = address.Unmap()
+	if !address.IsGlobalUnicast() || address.IsLoopback() || address.IsLinkLocalUnicast() {
+		return false
+	}
+	if address.IsPrivate() {
+		return allowPrivate
+	}
+	for _, prefix := range deniedRemoteCandidatePrefixes {
+		if prefix.Contains(address) {
+			return false
 		}
 	}
+	return true
 }
 
-// parseTaggedFrame splits a "<seq>\n<frame>" message into its sequence number
-// and frame data. Returns ok=false if the message is malformed.
-func parseTaggedFrame(raw string) (seq uint64, data string, ok bool) {
-	idx := strings.IndexByte(raw, '\n')
-	if idx < 0 {
-		return 0, "", false
-	}
-	s, err := strconv.ParseUint(raw[:idx], 10, 64)
-	if err != nil {
-		return 0, "", false
-	}
-	return s, raw[idx+1:], true
-}
-
-func (m *MeshManager) readSignalingLoop() {
-	for {
+func (manager *MeshManager) readSignalingLoop() {
+	messages := manager.signaler.Receive()
+	errorsChannel := manager.signaler.Errors()
+	for messages != nil || errorsChannel != nil {
 		select {
-		case <-m.ctx.Done():
+		case <-manager.ctx.Done():
 			return
-		case msg, ok := <-m.signaler.Receive():
+		case err, ok := <-errorsChannel:
 			if !ok {
-				return
+				errorsChannel = nil
+				continue
 			}
-			m.handleSignalingMessage(msg)
+			if err != nil {
+				manager.notifyError(err)
+			}
+		case message, ok := <-messages:
+			if !ok {
+				messages = nil
+				if manager.ctx.Err() == nil {
+					manager.notifyError(errors.New("signaling connection closed"))
+				}
+				continue
+			}
+			manager.handleSignalingMessage(message)
 		}
 	}
 }
 
-func (m *MeshManager) handleSignalingMessage(msg protocol.SignalingMessage) {
-	switch msg.Type {
-	case protocol.MsgRoomCreated:
-		m.mu.Lock()
-		m.LocalPeerID = msg.PeerID
-		m.mu.Unlock()
-		log.Printf("Joined room %s as %s", msg.RoomID, msg.PeerID)
-
-	case protocol.MsgTURNCredentials:
-		var creds protocol.TURNCredentials
-		if err := json.Unmarshal(msg.Payload, &creds); err == nil {
-			log.Printf("[ICE] Received TURN credentials: URLs=%v, Username=%s", creds.URLs, creds.Username)
-			m.SetICEServers([]webrtc.ICEServer{
-				{
-					URLs:       creds.URLs,
-					Username:   creds.Username,
-					Credential: creds.Credential,
-				},
-			})
-		} else {
-			log.Printf("[ICE] Failed to parse TURN credentials: %v", err)
-		}
-
+func (manager *MeshManager) handleSignalingMessage(message protocol.SignalingMessage) {
+	switch message.Type {
 	case protocol.MsgPeerJoined:
-		log.Printf("[SIGNAL] Received PeerJoined: peerID=%s, username=%s", msg.PeerID, msg.Username)
-		m.handlePeerJoined(msg)
-
+		manager.handlePeerJoined(message)
 	case protocol.MsgPeerLeft:
-		log.Printf("[SIGNAL] Received PeerLeft: peerID=%s", msg.PeerID)
-		m.handlePeerLeft(msg.PeerID)
-
+		manager.handlePeerLeft(message.PeerID)
 	case protocol.MsgOffer:
-		log.Printf("[SIGNAL] Received Offer from peerID=%s", msg.PeerID)
-		m.handleOffer(msg)
-
+		manager.handleOffer(message)
 	case protocol.MsgAnswer:
-		log.Printf("[SIGNAL] Received Answer from peerID=%s", msg.PeerID)
-		m.handleAnswer(msg)
-
+		manager.handleAnswer(message)
 	case protocol.MsgICECandidate:
-		log.Printf("[SIGNAL] Received ICE Candidate from peerID=%s", msg.PeerID)
-		m.handleICECandidate(msg)
-
+		manager.handleICECandidate(message)
+	case protocol.MsgError:
+		failure, err := protocol.DecodePayload[protocol.ErrorPayload](message.Payload)
+		if err != nil {
+			manager.notifyError(err)
+			return
+		}
+		manager.notifyError(fmt.Errorf("signaling error %s: %s", failure.Code, failure.Message))
 	default:
-		log.Printf("[SIGNAL] Unknown message type: %s", msg.Type)
+		manager.notifyError(fmt.Errorf("unexpected signaling message %q", message.Type))
 	}
 }
 
-func (m *MeshManager) createPeerConnection(peerID string) (*webrtc.PeerConnection, *webrtc.RTPSender, error) {
-	m.mu.RLock()
-	iceServers := m.iceServers
-	m.mu.RUnlock()
-
-	log.Printf("[ICE] Creating PeerConnection for %s with %d ICE servers", peerID, len(iceServers))
-	for _, s := range iceServers {
-		log.Printf("[ICE]   Server URLs: %v", s.URLs)
+func (manager *MeshManager) createPeerConnection(peerID string) (*webrtc.PeerConnection, *webrtc.RTPSender, error) {
+	manager.mu.RLock()
+	iceServers := append([]webrtc.ICEServer{}, manager.iceServers...)
+	localTrack := manager.localAudioTrack
+	muted := manager.isMuted
+	if muted || localTrack == nil {
+		localTrack = manager.silentAudioTrack
 	}
+	manager.mu.RUnlock()
 
-	config := webrtc.Configuration{
+	peerConnection, err := manager.webrtcAPI.NewPeerConnection(webrtc.Configuration{
 		ICEServers: iceServers,
-	}
-
-	pc, err := m.webrtcAPI.NewPeerConnection(config)
+	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("create WebRTC peer connection: %w", err)
 	}
-
-	m.mu.RLock()
-	localTrack := m.localAudioTrack
-	muted := m.isMuted
-	m.mu.RUnlock()
 
 	var audioSender *webrtc.RTPSender
 	if localTrack != nil {
-		if sender, err := pc.AddTrack(localTrack); err != nil {
-			log.Printf("Failed to add local audio track: %v", err)
-		} else {
-			audioSender = sender
-			if muted {
-				_ = audioSender.ReplaceTrack(nil)
-			}
+		audioSender, err = peerConnection.AddTrack(localTrack)
+		if err != nil {
+			_ = peerConnection.Close()
+			return nil, nil, fmt.Errorf("add local audio track: %w", err)
 		}
 	}
 
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		log.Printf("Received %s track from %s", track.Kind().String(), peerID)
-		if track.Kind() == webrtc.RTPCodecTypeAudio {
-			player, err := playback.NewPlayer()
-			if err != nil {
-				log.Printf("Failed to create audio player for %s: %v", peerID, err)
-				return
-			}
-			m.mu.Lock()
-			if p, ok := m.Peers[peerID]; ok {
-				p.Player = player
-			}
-			m.mu.Unlock()
-
-			go func() {
-				defer player.Close()
-				for {
-					packet, _, err := track.ReadRTP()
-					if err != nil {
-						return
-					}
-					if err := player.WriteOpus(packet.Payload); err != nil {
-						// Silence decode errors, as packet loss can corrupt frames
-					}
-				}
-			}()
-		}
-	})
-
-	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
-			log.Printf("[ICE] ICE gathering complete for peer %s", peerID)
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		if track.Kind() != webrtc.RTPCodecTypeAudio {
 			return
 		}
+		player, err := playback.NewPlayer()
+		if err != nil {
+			manager.notifyError(fmt.Errorf("create audio player for peer %s: %w", peerID, err))
+			return
+		}
+		peer := manager.peer(peerID)
+		if peer == nil {
+			player.Close()
+			return
+		}
+		previous, accepted := peer.SetPlayer(player)
+		if !accepted {
+			player.Close()
+			return
+		}
+		if previous != nil {
+			previous.Close()
+		}
 
-		log.Printf("[ICE] Generated candidate for %s: type=%s addr=%s:%d", peerID, c.Typ.String(), c.Address, c.Port)
+		go func() {
+			defer player.Close()
+			defer peer.ClearPlayer(player)
+			for {
+				packet, _, err := track.ReadRTP()
+				if err != nil {
+					return
+				}
+				if err := player.WriteOpus(packet.Payload); err != nil {
+					log.Printf("drop invalid Opus packet from peer %s", peerID)
+				}
+			}
+		}()
+	})
 
-		candJSON := c.ToJSON()
-
-		payload, _ := json.Marshal(protocol.ICECandidatePayload{
-			Candidate:        candJSON.Candidate,
-			SDPMid:           candJSON.SDPMid,
-			SDPMLineIndex:    candJSON.SDPMLineIndex,
-			UsernameFragment: candJSON.UsernameFragment,
+	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		candidateJSON := candidate.ToJSON()
+		payload, err := protocol.MarshalPayload(protocol.ICECandidatePayload{
+			Candidate:        candidateJSON.Candidate,
+			SDPMid:           candidateJSON.SDPMid,
+			SDPMLineIndex:    candidateJSON.SDPMLineIndex,
+			UsernameFragment: candidateJSON.UsernameFragment,
 		})
-
-		log.Printf("[ICE] Sending candidate to %s via signaling", peerID)
-		if err := m.signaler.Send(protocol.SignalingMessage{
-			Type:    protocol.MsgICECandidate,
-			PeerID:  peerID,
-			Payload: payload,
-		}); err != nil {
-			log.Printf("[ICE] ERROR sending candidate to %s: %v", peerID, err)
+		if err != nil {
+			manager.notifyError(err)
+			return
+		}
+		message := protocol.NewMessage(protocol.MsgICECandidate)
+		message.PeerID = peerID
+		message.Payload = payload
+		if err := manager.signaler.Send(message); err != nil {
+			manager.notifyError(fmt.Errorf("send ICE candidate to peer %s: %w", peerID, err))
 		}
 	})
 
-	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
-		log.Printf("[ICE] ICE connection state for %s: %s", peerID, s.String())
-	})
-
-	pc.OnICEGatheringStateChange(func(s webrtc.ICEGatheringState) {
-		log.Printf("[ICE] ICE gathering state for %s: %s", peerID, s.String())
-	})
-
-	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("Peer %s state changed: %s", peerID, s.String())
-		if s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed || s == webrtc.PeerConnectionStateDisconnected {
-			m.handlePeerLeft(peerID)
+	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		switch state {
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			manager.handlePeerLeft(peerID)
+		case webrtc.PeerConnectionStateDisconnected:
+			go manager.removeIfStillDisconnected(peerID, peerConnection)
 		}
 	})
 
-	return pc, audioSender, nil
+	return peerConnection, audioSender, nil
 }
 
-func (m *MeshManager) handlePeerJoined(msg protocol.SignalingMessage) {
-	peerID := msg.PeerID
-
-	m.mu.RLock()
-	_, exists := m.Peers[peerID]
-	m.mu.RUnlock()
-	if exists {
-		log.Printf("[SIGNAL] Peer %s already exists, skipping", peerID)
-		return // Already have this peer
+func (manager *MeshManager) removeIfStillDisconnected(peerID string, connection *webrtc.PeerConnection) {
+	timer := time.NewTimer(disconnectGracePeriod)
+	defer timer.Stop()
+	select {
+	case <-manager.ctx.Done():
+		return
+	case <-timer.C:
 	}
+	state := connection.ConnectionState()
+	if state == webrtc.PeerConnectionStateDisconnected || state == webrtc.PeerConnectionStateFailed {
+		manager.handlePeerLeft(peerID)
+	}
+}
 
-	pc, sender, err := m.createPeerConnection(peerID)
+func (manager *MeshManager) handlePeerJoined(message protocol.SignalingMessage) {
+	if manager.ctx.Err() != nil {
+		return
+	}
+	peerID := message.PeerID
+	if err := protocol.ValidatePeerID(peerID); err != nil {
+		manager.notifyError(err)
+		return
+	}
+	username, err := protocol.NormalizeUsername(message.Username)
 	if err != nil {
-		log.Printf("Failed to create PC for answer: %v", err)
+		manager.notifyError(err)
+		return
+	}
+	if manager.peer(peerID) != nil {
 		return
 	}
 
+	connection, sender, err := manager.createPeerConnection(peerID)
+	if err != nil {
+		manager.notifyError(fmt.Errorf("create peer %s: %w", peerID, err))
+		return
+	}
 	peer := &RemotePeer{
-		PeerID:      peerID,
-		Username:    msg.Username,
-		PC:          pc,
-		AudioSender: sender,
+		PeerID:       peerID,
+		Username:     username,
+		PC:           connection,
+		AudioSender:  sender,
+		pendingICE:   []webrtc.ICECandidateInit{},
+		frameLimiter: rate.NewLimiter(maxRemoteFrameRate, 2),
 	}
 
-	m.mu.Lock()
-	m.Peers[peerID] = peer
-	m.mu.Unlock()
+	manager.mu.Lock()
+	if _, exists := manager.Peers[peerID]; exists || manager.ctx.Err() != nil {
+		manager.mu.Unlock()
+		peer.Close()
+		return
+	}
+	manager.Peers[peerID] = peer
+	manager.mu.Unlock()
 
-	if m.OnPeerJoin != nil {
-		m.OnPeerJoin(peerID, peer.Username)
+	if manager.OnPeerJoin != nil {
+		manager.OnPeerJoin(peerID, username)
 	}
 
-	// Only initiate offer if LocalPeerID < peerID to avoid glare
-	m.mu.RLock()
-	localID := m.LocalPeerID
-	m.mu.RUnlock()
-
-	log.Printf("[SIGNAL] Glare check: localID=%s, peerID=%s, localID>peerID=%v", localID, peerID, localID > peerID)
-
-	if localID > peerID {
-		log.Printf("[SIGNAL] Waiting for offer from %s (we are the polite side)", peerID)
-		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-			log.Printf("[DATA] Received data channel '%s' from %s", dc.Label(), peerID)
-			if dc.Label() == "video-ascii" {
-				peer.DataChan = dc
-				dc.OnMessage(func(dMsg webrtc.DataChannelMessage) {
-					if !dMsg.IsString {
-						return
-					}
-					seq, frame, ok := parseTaggedFrame(string(dMsg.Data))
-					if !ok {
-						return
-					}
-					if !peer.CompareAndUpdateSeq(seq) {
-						return
-					}
-					peer.UpdateFrame(frame)
-					if m.OnFrame != nil {
-						m.OnFrame(peerID, frame)
-					}
-				})
-			}
+	if manager.LocalPeerID > peerID {
+		connection.OnDataChannel(func(channel *webrtc.DataChannel) {
+			manager.registerDataChannel(peer, channel)
 		})
 		return
 	}
 
-	log.Printf("[SIGNAL] Creating offer for %s (we are the impolite side)", peerID)
-
-	// Create unordered, unreliable datachannel for video frames
 	maxRetransmits := uint16(0)
 	ordered := false
-	dc, err := pc.CreateDataChannel("video-ascii", &webrtc.DataChannelInit{
+	channel, err := connection.CreateDataChannel("video-ascii", &webrtc.DataChannelInit{
 		MaxRetransmits: &maxRetransmits,
 		Ordered:        &ordered,
 	})
 	if err != nil {
-		log.Printf("Failed to create data channel: %v", err)
+		manager.notifyError(fmt.Errorf("create video channel for peer %s: %w", peerID, err))
+		manager.handlePeerLeft(peerID)
 		return
 	}
-	peer.DataChan = dc
+	manager.registerDataChannel(peer, channel)
 
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if !msg.IsString {
-			return
-		}
-		seq, frame, ok := parseTaggedFrame(string(msg.Data))
-		if !ok {
-			return
-		}
-		if !peer.CompareAndUpdateSeq(seq) {
-			return
-		}
-		peer.UpdateFrame(frame)
-		if m.OnFrame != nil {
-			m.OnFrame(peerID, frame)
-		}
-	})
-
-	// Create offer
-	offer, err := pc.CreateOffer(nil)
+	offer, err := connection.CreateOffer(nil)
 	if err != nil {
-		log.Printf("Failed to create offer: %v", err)
+		manager.notifyError(fmt.Errorf("create offer for peer %s: %w", peerID, err))
 		return
 	}
-
-	if err = pc.SetLocalDescription(offer); err != nil {
-		log.Printf("Failed to set local description: %v", err)
+	if err := connection.SetLocalDescription(offer); err != nil {
+		manager.notifyError(fmt.Errorf("set local offer for peer %s: %w", peerID, err))
 		return
 	}
-
-	log.Printf("[SIGNAL] Sending offer to %s (SDP length=%d)", peerID, len(offer.SDP))
-
-	payload, _ := json.Marshal(protocol.SDPPayload{
+	payload, err := protocol.MarshalPayload(protocol.SDPPayload{
 		Type: "offer",
 		SDP:  offer.SDP,
 	})
-
-	if err := m.signaler.Send(protocol.SignalingMessage{
-		Type:    protocol.MsgOffer,
-		PeerID:  peerID,
-		Payload: payload,
-	}); err != nil {
-		log.Printf("[SIGNAL] ERROR sending offer to %s: %v", peerID, err)
+	if err != nil {
+		manager.notifyError(err)
+		return
+	}
+	message = protocol.NewMessage(protocol.MsgOffer)
+	message.PeerID = peerID
+	message.Payload = payload
+	if err := manager.signaler.Send(message); err != nil {
+		manager.notifyError(fmt.Errorf("send offer to peer %s: %w", peerID, err))
 	}
 }
 
-func (m *MeshManager) handleOffer(msg protocol.SignalingMessage) {
-	peerID := msg.PeerID
-
-	m.mu.RLock()
-	peer, exists := m.Peers[peerID]
-	m.mu.RUnlock()
-
-	if !exists {
-		log.Printf("Received offer from unknown peer %s", peerID)
+func (manager *MeshManager) registerDataChannel(peer *RemotePeer, channel *webrtc.DataChannel) {
+	if channel.Label() != "video-ascii" {
+		_ = channel.Close()
 		return
 	}
-
-	var offerPayload protocol.SDPPayload
-	if err := json.Unmarshal(msg.Payload, &offerPayload); err != nil {
-		log.Printf("[SIGNAL] ERROR unmarshalling offer from %s: %v", peerID, err)
+	if !peer.SetDataChannel(channel) {
+		_ = channel.Close()
 		return
 	}
+	channel.OnMessage(func(message webrtc.DataChannelMessage) {
+		if !message.IsString || !peer.AllowFrame() {
+			return
+		}
+		sequence, frame, ok := parseTaggedFrame(message.Data)
+		if !ok || !peer.CompareAndUpdateSeq(sequence) {
+			return
+		}
+		peer.UpdateFrame(frame)
+		if manager.OnFrame != nil {
+			manager.OnFrame(peer.PeerID, frame)
+		}
+	})
+}
 
-	log.Printf("[SIGNAL] Setting remote offer from %s (SDP length=%d)", peerID, len(offerPayload.SDP))
-
-	offer := webrtc.SessionDescription{
+func (manager *MeshManager) handleOffer(message protocol.SignalingMessage) {
+	peer := manager.peer(message.PeerID)
+	if peer == nil {
+		manager.notifyError(fmt.Errorf("offer from unknown peer %s", message.PeerID))
+		return
+	}
+	payload, err := protocol.DecodePayload[protocol.SDPPayload](message.Payload)
+	if err != nil || payload.Type != "offer" || payload.SDP == "" {
+		manager.notifyError(fmt.Errorf("invalid offer from peer %s", message.PeerID))
+		return
+	}
+	if err := peer.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
-		SDP:  offerPayload.SDP,
-	}
-
-	if err := peer.PC.SetRemoteDescription(offer); err != nil {
-		log.Printf("Failed to set remote desc: %v", err)
+		SDP:  payload.SDP,
+	}); err != nil {
+		manager.notifyError(fmt.Errorf("set remote offer from peer %s: %w", message.PeerID, err))
 		return
 	}
 
 	answer, err := peer.PC.CreateAnswer(nil)
 	if err != nil {
-		log.Printf("Failed to create answer: %v", err)
+		manager.notifyError(fmt.Errorf("create answer for peer %s: %w", message.PeerID, err))
 		return
 	}
-
 	if err := peer.PC.SetLocalDescription(answer); err != nil {
-		log.Printf("Failed to set local desc: %v", err)
+		manager.notifyError(fmt.Errorf("set local answer for peer %s: %w", message.PeerID, err))
 		return
 	}
-
-	log.Printf("[SIGNAL] Sending answer to %s (SDP length=%d)", peerID, len(answer.SDP))
-
-	payload, _ := json.Marshal(protocol.SDPPayload{
+	answerPayload, err := protocol.MarshalPayload(protocol.SDPPayload{
 		Type: "answer",
 		SDP:  answer.SDP,
 	})
-
-	if err := m.signaler.Send(protocol.SignalingMessage{
-		Type:    protocol.MsgAnswer,
-		PeerID:  peerID,
-		Payload: payload,
-	}); err != nil {
-		log.Printf("[SIGNAL] ERROR sending answer to %s: %v", peerID, err)
+	if err != nil {
+		manager.notifyError(err)
+		return
+	}
+	response := protocol.NewMessage(protocol.MsgAnswer)
+	response.PeerID = message.PeerID
+	response.Payload = answerPayload
+	if err := manager.signaler.Send(response); err != nil {
+		manager.notifyError(fmt.Errorf("send answer to peer %s: %w", message.PeerID, err))
 	}
 }
 
-func (m *MeshManager) handleAnswer(msg protocol.SignalingMessage) {
-	m.mu.RLock()
-	peer, ok := m.Peers[msg.PeerID]
-	m.mu.RUnlock()
-
-	if !ok {
-		log.Printf("[SIGNAL] Received answer from unknown peer %s", msg.PeerID)
+func (manager *MeshManager) handleAnswer(message protocol.SignalingMessage) {
+	peer := manager.peer(message.PeerID)
+	if peer == nil {
+		manager.notifyError(fmt.Errorf("answer from unknown peer %s", message.PeerID))
 		return
 	}
-
-	var answerPayload protocol.SDPPayload
-	if err := json.Unmarshal(msg.Payload, &answerPayload); err != nil {
-		log.Printf("[SIGNAL] ERROR unmarshalling answer from %s: %v", msg.PeerID, err)
+	payload, err := protocol.DecodePayload[protocol.SDPPayload](message.Payload)
+	if err != nil || payload.Type != "answer" || payload.SDP == "" {
+		manager.notifyError(fmt.Errorf("invalid answer from peer %s", message.PeerID))
 		return
 	}
-
-	log.Printf("[SIGNAL] Setting remote answer from %s (SDP length=%d)", msg.PeerID, len(answerPayload.SDP))
-
-	answer := webrtc.SessionDescription{
+	if err := peer.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
-		SDP:  answerPayload.SDP,
-	}
-
-	if err := peer.PC.SetRemoteDescription(answer); err != nil {
-		log.Printf("Failed to set remote desc: %v", err)
-	} else {
-		log.Printf("[SIGNAL] Successfully set remote answer from %s", msg.PeerID)
+		SDP:  payload.SDP,
+	}); err != nil {
+		manager.notifyError(fmt.Errorf("set remote answer from peer %s: %w", message.PeerID, err))
 	}
 }
 
-func (m *MeshManager) handleICECandidate(msg protocol.SignalingMessage) {
-	m.mu.RLock()
-	peer, ok := m.Peers[msg.PeerID]
-	m.mu.RUnlock()
-
-	if !ok {
-		log.Printf("[ICE] Received candidate from unknown peer %s, ignoring", msg.PeerID)
+func (manager *MeshManager) handleICECandidate(message protocol.SignalingMessage) {
+	peer := manager.peer(message.PeerID)
+	if peer == nil {
+		manager.notifyError(fmt.Errorf("ICE candidate from unknown peer %s", message.PeerID))
 		return
 	}
-
-	var candPayload protocol.ICECandidatePayload
-	if err := json.Unmarshal(msg.Payload, &candPayload); err != nil {
-		log.Printf("[ICE] ERROR unmarshalling candidate from %s: %v", msg.PeerID, err)
+	payload, err := protocol.DecodePayload[protocol.ICECandidatePayload](message.Payload)
+	if err != nil || payload.Candidate == "" {
+		manager.notifyError(fmt.Errorf("invalid ICE candidate from peer %s", message.PeerID))
 		return
 	}
-
-	log.Printf("[ICE] Adding remote candidate from %s: %s", msg.PeerID, candPayload.Candidate)
-
-	cand := webrtc.ICECandidateInit{
-		Candidate:        candPayload.Candidate,
-		SDPMid:           candPayload.SDPMid,
-		SDPMLineIndex:    candPayload.SDPMLineIndex,
-		UsernameFragment: candPayload.UsernameFragment,
-	}
-
-	if err := peer.PC.AddICECandidate(cand); err != nil {
-		log.Printf("[ICE] ERROR adding candidate from %s: %v", msg.PeerID, err)
-	} else {
-		log.Printf("[ICE] Successfully added candidate from %s", msg.PeerID)
+	if err := peer.AddICECandidate(webrtc.ICECandidateInit{
+		Candidate:        payload.Candidate,
+		SDPMid:           payload.SDPMid,
+		SDPMLineIndex:    payload.SDPMLineIndex,
+		UsernameFragment: payload.UsernameFragment,
+	}); err != nil {
+		manager.notifyError(fmt.Errorf("add ICE candidate from peer %s: %w", message.PeerID, err))
 	}
 }
 
-func (m *MeshManager) handlePeerLeft(peerID string) {
-	m.mu.Lock()
-	peer, ok := m.Peers[peerID]
-	if ok {
-		delete(m.Peers, peerID)
+func (manager *MeshManager) handlePeerLeft(peerID string) {
+	manager.mu.Lock()
+	peer, exists := manager.Peers[peerID]
+	if exists {
+		delete(manager.Peers, peerID)
 	}
-	m.mu.Unlock()
+	manager.mu.Unlock()
+	if !exists {
+		return
+	}
+	peer.Close()
+	if manager.OnPeerLeave != nil {
+		manager.OnPeerLeave(peerID)
+	}
+}
 
-	if ok {
-		peer.Close()
-		if m.OnPeerLeave != nil {
-			m.OnPeerLeave(peerID)
-		}
+func (manager *MeshManager) peer(peerID string) *RemotePeer {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.Peers[peerID]
+}
+
+func (manager *MeshManager) notifyError(err error) {
+	if err != nil && manager.OnError != nil {
+		manager.OnError(err)
 	}
 }

@@ -1,0 +1,229 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: 1.26.5
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - id: tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH or a prerelease suffix." >&2
+            exit 1
+          fi
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  macos-client:
+    name: Build macOS ARM64 native client
+    needs: validate-tag
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Build signed-input native artifact
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          test "$(uname -m)" = arm64
+          package="release/termcall_${VERSION}_darwin_arm64"
+          mkdir -p "$package"
+          ./scripts/build_macos.sh "$package/termcall"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md "$package/"
+          tar -C release -czf "release/termcall_${VERSION}_darwin_arm64.tar.gz" "termcall_${VERSION}_darwin_arm64"
+          rm -rf "$package"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-macos-client
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-artifacts:
+    name: Build Linux AMD64 artifacts
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Build receive-only client and server
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          client_package="release/termcall_${VERSION}_linux_amd64_receive_only"
+          server_package="release/termcall-server_${VERSION}_linux_amd64"
+          mkdir -p "$client_package" "$server_package"
+          env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -ldflags="-s -w" -o "$client_package/termcall" ./cmd/termcall
+          env CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=true -ldflags="-s -w" -o "$server_package/termcall-server" ./cmd/termcall-server
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md "$client_package/"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md "$server_package/"
+          tar -C release -czf "release/termcall_${VERSION}_linux_amd64_receive_only.tar.gz" "termcall_${VERSION}_linux_amd64_receive_only"
+          tar -C release -czf "release/termcall-server_${VERSION}_linux_amd64.tar.gz" "termcall-server_${VERSION}_linux_amd64"
+          rm -rf "$client_package" "$server_package"
+          ./scripts/generate_third_party_notices.sh release/THIRD_PARTY_NOTICES.txt
+
+      - name: Upload Linux artifacts and notices
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-linux-artifacts
+          path: release/
+          if-no-files-found: error
+          retention-days: 7
+
+  container:
+    name: Publish non-root server image
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      image: ${{ steps.image.outputs.value }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Determine image name
+        id: image
+        run: echo "value=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.image.outputs.value }}:${{ needs.validate-tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate-tag.outputs.tag }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Attest container provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.value }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  release:
+    name: Publish prerelease assets
+    needs: [validate-tag, macos-client, linux-artifacts, container]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out source for SBOM
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download binary archives and notices
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: release/termcall_${{ needs.validate-tag.outputs.version }}_sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Record immutable container reference and checksums
+        env:
+          IMAGE: ${{ needs.container.outputs.image }}
+          DIGEST: ${{ needs.container.outputs.digest }}
+        run: |
+          printf '%s@%s\n' "$IMAGE" "$DIGEST" > release/CONTAINER_IMAGE.txt
+          (
+            cd release
+            sha256sum -- *.tar.gz THIRD_PARTY_NOTICES.txt CONTAINER_IMAGE.txt *.spdx.json
+          ) > release/CHECKSUMS.txt
+
+      - name: Attest release provenance and SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: release/CHECKSUMS.txt
+          sbom-path: release/termcall_${{ needs.validate-tag.outputs.version }}_sbom.spdx.json
+
+      - name: Create GitHub prerelease
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: TermCall ${{ needs.validate-tag.outputs.tag }}
+          prerelease: ${{ contains(needs.validate-tag.outputs.tag, '-') }}
+          make_latest: false
+          generate_release_notes: true
+          body: |
+            ## Release verification
+
+            - Verify downloaded archives against `CHECKSUMS.txt`.
+            - The macOS ARM64 client includes native camera and microphone support.
+            - The Linux client artifact is receive-only; it has no native media capture.
+            - The immutable server image reference is in `CONTAINER_IMAGE.txt`.
+            - GitHub Actions build provenance and SBOM attestations are attached to this release.
+          files: release/*
+          fail_on_unmatched_files: true

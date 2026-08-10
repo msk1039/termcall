@@ -21,3 +21,7 @@ debug.log
 *.md
 termcall
 termcall-server
+!cmd/termcall
+!cmd/termcall/**
+!cmd/termcall-server
+!cmd/termcall-server/**
